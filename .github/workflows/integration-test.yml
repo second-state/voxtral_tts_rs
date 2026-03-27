@@ -77,8 +77,7 @@ jobs:
       - name: Download model
         run: bash scripts/download_model.sh
 
-      - name: Convert voice embeddings to safetensors (MLX)
-        if: matrix.backend == 'mlx'
+      - name: Convert voice embeddings to safetensors
         run: |
           pip3 install torch safetensors --quiet
           python3 -c "
