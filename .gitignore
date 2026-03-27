@@ -1,0 +1,9 @@
+/target/
+models/
+libtorch/
+*.wav
+*.mp3
+*.flac
+*.pcm
+.DS_Store
+Cargo.lock
