@@ -1,0 +1,202 @@
+name: Integration Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      text:
+        description: "Text to synthesize"
+        default: "Hello! This is a test of the Voxtral text to speech system running on CI."
+        required: false
+      voice:
+        description: "Voice preset"
+        default: "neutral_female"
+        required: false
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            name: Linux ARM64 (tch)
+            backend: tch
+            libtorch-url: https://github.com/second-state/libtorch-releases/releases/download/v2.7.1/libtorch-cxx11-abi-aarch64-2.7.1.tar.gz
+            libtorch-archive: libtorch.tar.gz
+          - os: macos-latest
+            name: macOS ARM64 (MLX)
+            backend: mlx
+
+    runs-on: ${{ matrix.os }}
+    name: Integration (${{ matrix.name }})
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Init MLX submodule
+        if: matrix.backend == 'mlx'
+        run: git submodule update --init --recursive
+
+      - name: Delete Cargo.lock
+        run: rm -f Cargo.lock
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # ---------------------------------------------------------------
+      # Build
+      # ---------------------------------------------------------------
+
+      - name: Download libtorch
+        if: matrix.backend == 'tch'
+        run: curl -Lo ${{ matrix.libtorch-archive }} "${{ matrix.libtorch-url }}"
+
+      - name: Extract libtorch
+        if: matrix.backend == 'tch'
+        run: tar xzf ${{ matrix.libtorch-archive }}
+
+      - name: Set linker rpath-link (Linux only)
+        if: runner.os == 'Linux' && matrix.backend == 'tch'
+        run: echo "RUSTFLAGS=-C link-arg=-Wl,-rpath-link,${{ github.workspace }}/libtorch/lib" >> "$GITHUB_ENV"
+
+      - name: Build (tch)
+        if: matrix.backend == 'tch'
+        env:
+          LIBTORCH: ${{ github.workspace }}/libtorch
+          LIBTORCH_BYPASS_VERSION_CHECK: "1"
+        run: cargo build --release
+
+      - name: Build (MLX)
+        if: matrix.backend == 'mlx'
+        run: cargo build --release --no-default-features --features mlx
+
+      # ---------------------------------------------------------------
+      # Download model
+      # ---------------------------------------------------------------
+
+      - name: Download model
+        run: bash scripts/download_model.sh
+
+      - name: Convert voice embeddings to safetensors (MLX)
+        if: matrix.backend == 'mlx'
+        run: |
+          pip3 install torch safetensors --quiet
+          python3 -c "
+          import torch, os
+          from safetensors.torch import save_file
+          d = 'models/voxtral-4b-tts/voice_embedding'
+          for f in sorted(os.listdir(d)):
+              if f.endswith('.pt'):
+                  t = torch.load(os.path.join(d, f), map_location='cpu', weights_only=True)
+                  save_file({'embedding': t}, os.path.join(d, f.replace('.pt', '.safetensors')))
+                  print(f'Converted {f}')
+          "
+
+      # ---------------------------------------------------------------
+      # Set runtime library paths
+      # ---------------------------------------------------------------
+
+      - name: Set library path (Linux)
+        if: runner.os == 'Linux' && matrix.backend == 'tch'
+        run: echo "LD_LIBRARY_PATH=${{ github.workspace }}/libtorch/lib:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # CLI tests
+      # ---------------------------------------------------------------
+
+      - name: "CLI: Generate speech (English, neutral_female)"
+        run: |
+          ./target/release/voxtral-tts models/voxtral-4b-tts \
+            --text "${{ inputs.text }}" \
+            --voice neutral_female \
+            --output neutral_female_english.wav
+          file neutral_female_english.wav
+          ls -lh neutral_female_english.wav
+
+      - name: "CLI: Generate speech (French, fr_female)"
+        run: |
+          ./target/release/voxtral-tts models/voxtral-4b-tts \
+            --text "Bonjour! Ceci est un test du système Voxtral." \
+            --voice fr_female \
+            --output fr_female_french.wav
+          file fr_female_french.wav
+          ls -lh fr_female_french.wav
+
+      - name: "CLI: Generate speech (custom voice via input)"
+        if: inputs.voice != 'neutral_female'
+        run: |
+          ./target/release/voxtral-tts models/voxtral-4b-tts \
+            --text "${{ inputs.text }}" \
+            --voice "${{ inputs.voice }}" \
+            --output custom_voice.wav
+          file custom_voice.wav
+          ls -lh custom_voice.wav
+
+      - name: "CLI: List voices"
+        run: ./target/release/voxtral-tts models/voxtral-4b-tts --list-voices --text ""
+
+      # ---------------------------------------------------------------
+      # API server tests
+      # ---------------------------------------------------------------
+
+      - name: "Server: Start in background"
+        run: |
+          ./target/release/voxtral-tts-server models/voxtral-4b-tts --port 8090 &
+          SERVER_PID=$!
+          echo "SERVER_PID=$SERVER_PID" >> "$GITHUB_ENV"
+          # Wait for server to be ready
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8090/health > /dev/null 2>&1; then
+              echo "Server ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8090/health || (echo "Server failed to start"; kill $SERVER_PID 2>/dev/null; exit 1)
+
+      - name: "Server: GET /health"
+        run: curl -sf http://127.0.0.1:8090/health | tee /dev/stderr | grep -q ok
+
+      - name: "Server: GET /v1/models"
+        run: curl -sf http://127.0.0.1:8090/v1/models | tee /dev/stderr | grep -q voxtral
+
+      - name: "Server: POST /v1/audio/speech (alloy)"
+        run: |
+          curl -sf -X POST http://127.0.0.1:8090/v1/audio/speech \
+            -H "Content-Type: application/json" \
+            -d '{"input":"Hello from the API server.","voice":"alloy","model":"voxtral-4b-tts"}' \
+            -o api_alloy.wav
+          file api_alloy.wav
+          ls -lh api_alloy.wav
+
+      - name: "Server: POST /v1/audio/speech (es_male)"
+        run: |
+          curl -sf -X POST http://127.0.0.1:8090/v1/audio/speech \
+            -H "Content-Type: application/json" \
+            -d '{"input":"Hola, esta es una prueba del servidor.","voice":"es_male","model":"voxtral-4b-tts"}' \
+            -o api_es_male.wav
+          file api_es_male.wav
+          ls -lh api_es_male.wav
+
+      - name: "Server: Stop"
+        if: always()
+        run: kill ${{ env.SERVER_PID }} 2>/dev/null || true
+
+      # ---------------------------------------------------------------
+      # Upload audio artifacts
+      # ---------------------------------------------------------------
+
+      - name: Upload generated audio
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-${{ matrix.os }}-${{ matrix.backend }}
+          path: "*.wav"
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.os }}-${{ matrix.backend }}
+          path: |
+            target/release/voxtral-tts
+            target/release/voxtral-tts-server

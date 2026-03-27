@@ -73,37 +73,28 @@ jobs:
         if: matrix.backend == 'mlx'
         run: cargo build --release --no-default-features --features mlx
 
-      - name: Set library path (Linux)
-        if: runner.os == 'Linux' && matrix.backend == 'tch'
-        run: echo "LD_LIBRARY_PATH=${{ github.workspace }}/libtorch/lib:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+      - name: Run unit tests (tch)
+        if: matrix.backend == 'tch'
+        env:
+          LIBTORCH: ${{ github.workspace }}/libtorch
+          LIBTORCH_BYPASS_VERSION_CHECK: "1"
+          LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
+        run: cargo test --release
 
-      - name: Set library path (macOS)
-        if: runner.os == 'macOS' && matrix.backend == 'tch'
-        run: echo "DYLD_LIBRARY_PATH=${{ github.workspace }}/libtorch/lib:$DYLD_LIBRARY_PATH" >> "$GITHUB_ENV"
+      - name: Run unit tests (MLX)
+        if: matrix.backend == 'mlx'
+        run: cargo test --release --no-default-features --features mlx
 
-      - name: Download model
-        run: bash scripts/download_model.sh
+      - name: Smoke test - CLI prints help
+        run: ./target/release/voxtral-tts --help
 
-      - name: Generate speech (preset voice)
-        run: |
-          ./target/release/voxtral-tts models/voxtral-4b-tts \
-            --text "Hello! This is a test of the Voxtral TTS system running on CI." \
-            --voice neutral_female \
-            --output neutral_female_english.wav
+      - name: Smoke test - server prints help
+        run: ./target/release/voxtral-tts-server --help
 
-      - name: Generate speech (French)
-        run: |
-          ./target/release/voxtral-tts models/voxtral-4b-tts \
-            --text "Bonjour! Ceci est un test du système Voxtral TTS." \
-            --voice fr_female \
-            --output fr_female_french.wav
-
-      - name: Upload artifacts
+      - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
-          name: voxtral-tts-${{ matrix.os }}-${{ runner.arch }}-${{ matrix.backend }}.zip
+          name: voxtral-tts-${{ matrix.os }}-${{ runner.arch }}-${{ matrix.backend }}
           path: |
             target/release/voxtral-tts
             target/release/voxtral-tts-server
-            neutral_female_english.wav
-            fr_female_french.wav
