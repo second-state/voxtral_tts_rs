@@ -30,15 +30,24 @@ impl RMSNorm {
 
     /// Apply RMS normalization.
     pub fn forward(&self, x: &Tensor) -> Tensor {
-        // x: [..., dim]
-        // variance = mean(x^2, dim=-1, keepdim=true)
-        let x_f32 = x.to_dtype(DType::Float32);
-        let variance = x_f32.pow_scalar(2.0).mean_dim(&[-1], true);
-        // rsqrt(variance + eps)
-        let normed = &x_f32 / &((&variance + self.eps).sqrt());
-        // Scale and cast back to original dtype
-        let out = &normed * &self.weight.to_dtype(DType::Float32);
-        out.to_dtype(x.kind())
+        #[cfg(feature = "mlx")]
+        {
+            // Use MLX fused RMSNorm kernel — single GPU dispatch instead of 6 ops
+            Tensor::from_mlx(crate::backend::mlx::ops::fast_rms_norm(
+                x.as_mlx(),
+                self.weight.as_mlx(),
+                self.eps as f32,
+            ))
+        }
+        #[cfg(not(feature = "mlx"))]
+        {
+            // x: [..., dim]
+            let x_f32 = x.to_dtype(DType::Float32);
+            let variance = x_f32.pow_scalar(2.0).mean_dim(&[-1], true);
+            let normed = &x_f32 / &((&variance + self.eps).sqrt());
+            let out = &normed * &self.weight.to_dtype(DType::Float32);
+            out.to_dtype(x.kind())
+        }
     }
 }
 
@@ -88,10 +97,16 @@ impl Linear {
 /// Pre-computes sin/cos tables up to `max_seq_len` and applies rotary
 /// transformations to query and key tensors.
 pub struct RotaryEmbedding {
-    /// Cosine component: `[max_seq_len, dim/2]`
+    /// Cosine component: `[max_seq_len, dim/2]` (used by tch backend)
+    #[allow(dead_code)]
     cos_cached: Tensor,
-    /// Sine component: `[max_seq_len, dim/2]`
+    /// Sine component: `[max_seq_len, dim/2]` (used by tch backend)
+    #[allow(dead_code)]
     sin_cached: Tensor,
+    /// Head dimension (for fused RoPE).
+    dim: usize,
+    /// Base frequency (for fused RoPE).
+    theta: f64,
 }
 
 impl RotaryEmbedding {
@@ -125,6 +140,8 @@ impl RotaryEmbedding {
         Self {
             cos_cached,
             sin_cached,
+            dim,
+            theta,
         }
     }
 
@@ -135,14 +152,26 @@ impl RotaryEmbedding {
     /// * `seq_len` – actual sequence length (for slicing cached tables).
     ///
     /// Returns `(q_rotated, k_rotated)` with the same shapes.
-    pub fn forward(&self, q: &Tensor, k: &Tensor, seq_len: usize) -> (Tensor, Tensor) {
-        // Slice cached embeddings to actual sequence length: [seq_len, dim/2]
-        let cos = self.cos_cached.narrow(0, 0, seq_len as i64);
-        let sin = self.sin_cached.narrow(0, 0, seq_len as i64);
-
-        let q_rot = apply_rotary_emb(q, &cos, &sin);
-        let k_rot = apply_rotary_emb(k, &cos, &sin);
-        (q_rot, k_rot)
+    pub fn forward(&self, q: &Tensor, k: &Tensor, _seq_len: usize) -> (Tensor, Tensor) {
+        #[cfg(feature = "mlx")]
+        {
+            // Use MLX fused RoPE kernel — single GPU dispatch
+            let q_rot = Tensor::from_mlx(crate::backend::mlx::ops::fast_rope(
+                q.as_mlx(), self.dim as i32, false, Some(self.theta as f32), 1.0, 0,
+            ));
+            let k_rot = Tensor::from_mlx(crate::backend::mlx::ops::fast_rope(
+                k.as_mlx(), self.dim as i32, false, Some(self.theta as f32), 1.0, 0,
+            ));
+            (q_rot, k_rot)
+        }
+        #[cfg(not(feature = "mlx"))]
+        {
+            let cos = self.cos_cached.narrow(0, 0, _seq_len as i64);
+            let sin = self.sin_cached.narrow(0, 0, _seq_len as i64);
+            let q_rot = apply_rotary_emb(q, &cos, &sin);
+            let k_rot = apply_rotary_emb(k, &cos, &sin);
+            (q_rot, k_rot)
+        }
     }
 
     /// Apply rotary embedding starting from a specific position offset.
@@ -154,20 +183,35 @@ impl RotaryEmbedding {
         q: &Tensor,
         k: &Tensor,
         pos: usize,
-        seq_len: usize,
+        _seq_len: usize,
     ) -> (Tensor, Tensor) {
-        let cos = self.cos_cached.narrow(0, pos as i64, seq_len as i64);
-        let sin = self.sin_cached.narrow(0, pos as i64, seq_len as i64);
-        let q_rot = apply_rotary_emb(q, &cos, &sin);
-        let k_rot = apply_rotary_emb(k, &cos, &sin);
-        (q_rot, k_rot)
+        #[cfg(feature = "mlx")]
+        {
+            // Use MLX fused RoPE kernel with offset — single GPU dispatch
+            let q_rot = Tensor::from_mlx(crate::backend::mlx::ops::fast_rope(
+                q.as_mlx(), self.dim as i32, false, Some(self.theta as f32), 1.0, pos as i32,
+            ));
+            let k_rot = Tensor::from_mlx(crate::backend::mlx::ops::fast_rope(
+                k.as_mlx(), self.dim as i32, false, Some(self.theta as f32), 1.0, pos as i32,
+            ));
+            (q_rot, k_rot)
+        }
+        #[cfg(not(feature = "mlx"))]
+        {
+            let cos = self.cos_cached.narrow(0, pos as i64, _seq_len as i64);
+            let sin = self.sin_cached.narrow(0, pos as i64, _seq_len as i64);
+            let q_rot = apply_rotary_emb(q, &cos, &sin);
+            let k_rot = apply_rotary_emb(k, &cos, &sin);
+            (q_rot, k_rot)
+        }
     }
 }
 
-/// Apply the rotary embedding to a single tensor.
+/// Apply the rotary embedding to a single tensor (tch backend only).
 ///
 /// `x`: `[batch, n_heads, seq_len, head_dim]`
 /// `cos`, `sin`: `[seq_len, head_dim/2]`
+#[cfg(not(feature = "mlx"))]
 fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Tensor {
     let shape = x.size(); // [B, H, S, D]
     let head_dim = *shape.last().unwrap();
@@ -312,34 +356,58 @@ impl Attention {
         let new_k = k.clone();
         let new_v = v.clone();
 
-        // Expand KV heads for GQA: repeat each KV head n_heads/n_kv_heads times
-        let (k, v) = if self.n_kv_heads < self.n_heads {
-            let n_rep = self.n_heads / self.n_kv_heads;
-            let k = repeat_kv(&k, n_rep);
-            let v = repeat_kv(&v, n_rep);
-            (k, v)
-        } else {
-            (k, v)
-        };
-
         // Scaled dot-product attention
-        let kv_seq_len = k.size()[2];
-        let scale = (self.head_dim as f64).sqrt();
-        tracing::trace!("Q shape: {:?}, K shape: {:?}", q.size(), k.size());
-        let scores = q.matmul(&k.transpose(-2, -1)) / scale; // [B, nH, S, kv_S]
+        let context = {
+            #[cfg(feature = "mlx")]
+            {
+                // Use MLX fused SDPA kernel — handles GQA natively, no repeat_kv needed
+                let scale = 1.0 / (self.head_dim as f32).sqrt();
+                let mask = if causal && seq_len > 1 {
+                    // Build additive causal mask: 0 for attend, -inf for mask.
+                    // Cannot use ones().triu() * -inf because 0 * -inf = NaN in IEEE 754.
+                    // Instead, use a large finite negative value.
+                    let kv_seq_len = k.size()[2];
+                    let mask = Tensor::ones(&[seq_len as i64, kv_seq_len], DType::Float32, x.device())
+                        .triu(kv_seq_len - seq_len as i64 + 1)
+                        * (-1e9);
+                    Some(mask.to_dtype(q.kind()))
+                } else {
+                    None
+                };
+                Tensor::from_mlx(crate::backend::mlx::ops::fast_scaled_dot_product_attention(
+                    q.as_mlx(),
+                    k.as_mlx(),
+                    v.as_mlx(),
+                    scale,
+                    mask.as_ref().map(|m| m.as_mlx()),
+                ))
+            }
+            #[cfg(not(feature = "mlx"))]
+            {
+                // Manual attention for tch backend
+                let (k, v) = if self.n_kv_heads < self.n_heads {
+                    let n_rep = self.n_heads / self.n_kv_heads;
+                    (repeat_kv(&k, n_rep), repeat_kv(&v, n_rep))
+                } else {
+                    (k, v)
+                };
 
-        // Apply causal mask if needed
-        let scores = if causal && seq_len > 1 {
-            // Build a causal mask: positions can only attend to earlier positions
-            let mask = Tensor::ones(&[seq_len as i64, kv_seq_len], DType::Bool, x.device())
-                .triu(kv_seq_len - seq_len as i64 + 1);
-            scores.masked_fill(&mask, f64::NEG_INFINITY)
-        } else {
-            scores
-        };
+                let kv_seq_len = k.size()[2];
+                let scale = (self.head_dim as f64).sqrt();
+                let scores = q.matmul(&k.transpose(-2, -1)) / scale;
 
-        let attn = scores.softmax(-1);
-        let context = attn.matmul(&v); // [B, nH, S, D]
+                let scores = if causal && seq_len > 1 {
+                    let mask = Tensor::ones(&[seq_len as i64, kv_seq_len], DType::Bool, x.device())
+                        .triu(kv_seq_len - seq_len as i64 + 1);
+                    scores.masked_fill(&mask, f64::NEG_INFINITY)
+                } else {
+                    scores
+                };
+
+                let attn = scores.softmax(-1);
+                attn.matmul(&v)
+            }
+        }; // [B, nH, S, D]
 
         // Reshape back: [B, nH, S, D] -> [B, S, nH*D]
         let context = context.transpose(1, 2).contiguous().reshape(&[
@@ -358,6 +426,7 @@ impl Attention {
 /// Repeat KV heads to match the number of query heads for GQA.
 ///
 /// `x`: `[B, n_kv_heads, S, D]` -> `[B, n_heads, S, D]`
+#[cfg(not(feature = "mlx"))]
 fn repeat_kv(x: &Tensor, n_rep: usize) -> Tensor {
     if n_rep == 1 {
         return x.clone();

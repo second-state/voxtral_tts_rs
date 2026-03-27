@@ -85,20 +85,24 @@ The code must parse these with `resolve_str_fields()` after serde deserializatio
 
 ## MLX Backend -- Critical Lessons
 
-### 1. Lazy Evaluation Requires Explicit `eval()` Calls
+### 1. Lazy Evaluation — eval() at Outer Loop Boundaries Only
 
-MLX builds a computation graph lazily. Without calling `eval()`, the graph grows unboundedly during autoregressive generation, causing exponential slowdowns and eventual crashes.
+MLX builds a computation graph lazily. The graph must be evaluated periodically to prevent unbounded growth, but **over-evaluating kills performance**. Per the MLX documentation and mlx-lm reference implementation, eval() should be called at outer loop boundaries, not per-layer.
 
-**Where eval() is required:**
+**Where eval() is required (current optimized placement):**
 
-- After each transformer layer in `forward_one_embedding()` (backbone AR decode loop)
-- After each transformer layer in `forward_prefill_embeddings()` (backbone prefill)
-- After each Euler step in `decode_acoustic()` (flow matching ODE)
-- After each transformer layer in `predict_velocity()` (flow matching)
-- After each conv/transformer block in `run_decoder()` (codec)
-- Before using `hidden_state` in flow matching (eval the backbone output)
+- After the full 26-layer backbone forward pass in `forward_one_embedding()` — 1 eval per frame
+- After the full 26-layer backbone forward pass in `forward_prefill_embeddings()` — 1 eval total
+- After each Euler step in `decode_acoustic()` (flow matching ODE) — 7 evals per frame
+- After the full codec decoder (all 4 blocks) in `run_decoder()` — 1 eval per decode
 
-**Symptom of missing eval():** Each generation step takes exponentially longer (0.4s, 1s, 5s, 17s, 52s, 124s...), then MLX crashes with a matmul shape error on random-looking dimensions.
+**Where eval() is NOT needed:**
+- Per transformer layer (the graph for 26 layers is fine — "thousands of ops" per eval is OK)
+- Per flow matching `predict_velocity()` call (only 3 layers on 3 tokens — tiny graph)
+- Per codec conv/transformer block
+
+**Symptom of too few eval():** Graph grows across iterations, causing exponential slowdowns.
+**Symptom of too many eval():** Each eval() has fixed overhead for graph traversal, scheduling, and GPU synchronization. Reducing from ~130 to ~8 eval() calls per frame improved flow matching from 0.53s to 0.28s per frame.
 
 ### 2. KV Cache Must Replace, Not Concatenate
 
@@ -150,8 +154,8 @@ The `tensor.rs` conv methods handle these transposes automatically. The weights 
 2. **36 acoustic codes**: Euler ODE flow matching
    - Initialize `x_0 ~ N(0, 1)` with shape [1, 36]
    - 7 Euler steps from t=0 to t=1
-   - Each step: build 3-token sequence `[acoustic_proj, time_emb, llm_proj]`, run 3 bidirectional transformer layers
-   - Classifier-free guidance: `v = 1.2 * v_cond - 0.2 * v_uncond`
+   - Each step: build batched 3-token sequence `[acoustic_proj, time_emb, llm_proj]` with batch=2 (cond + uncond), run 3 bidirectional transformer layers
+   - Classifier-free guidance: `v = 1.2 * v_cond - 0.2 * v_uncond` (batched CFG: both passes in single forward)
    - Quantize output to FSQ levels: map [-1,1] to [0,20], add +2 offset for special tokens
 
 ### Audio Codebook Embeddings
@@ -202,9 +206,25 @@ Both are areas for improvement if audio quality needs to be refined.
 
 On Apple M4 Max (MLX backend):
 - Model loading: ~0.1s (memory-mapped safetensors)
-- Prefill (221 tokens, 26 layers): ~3s
-- Per-frame generation: ~1s (26 backbone layers + 14 flow matching forward passes)
-- Codec decoding: ~0.5s
-- Total for "Hello." (110 frames): ~2.5 minutes
+- Prefill (221 tokens, 26 layers): ~3.3s
+- Per-frame generation: ~0.34s (backbone ~70ms + flow matching ~270ms)
+- Codec decoding: ~0.2s
+- Total for "Hello." (110 frames): ~41s (~2.9 frames/s, RTF ~4.7)
 
-The main bottleneck is per-frame generation: each frame requires a full backbone forward pass (26 layers) plus 14 flow matching forward passes (7 Euler steps x 2 for CFG). Optimization opportunities include KV cache optimization, batched flow matching, and reducing eval() frequency.
+### Optimizations Applied (2.5x total speedup)
+
+1. **Fused MLX ops**: SDPA (`fast_scaled_dot_product_attention`), RMSNorm (`fast_rms_norm`), and RoPE (`fast_rope`) use fused Metal kernels. SDPA handles GQA natively (no `repeat_kv` expansion needed). RMSNorm replaces 6 discrete ops with 1 kernel.
+
+2. **Batched CFG**: The flow matching CFG conditional and unconditional passes are batched together (batch=2) into a single forward pass through the 3 transformer layers, halving Metal kernel dispatch overhead.
+
+3. **Reduced eval() frequency**: From ~130 eval() calls per frame to ~2 (backbone + flow matching). The backbone does a single eval() after all 26 layers, and the flow matching does one eval() after all 7 Euler steps.
+
+4. **BF16 flow matching**: Random noise, zeros, and time embeddings are cast to BF16 to match weight dtype, avoiding implicit F32 promotion.
+
+5. **Pre-computed time projections**: The 7 sinusoidal time step embeddings (constant across all frames) are pre-computed at model init.
+
+6. **SDPA mask NaN fix**: Causal attention mask uses `-1e9` instead of `-inf` to avoid `0 * -inf = NaN` in IEEE 754.
+
+### Remaining Bottleneck
+
+Flow matching is 80% of per-frame time (270ms vs 70ms backbone). Each frame requires 7 Euler steps × 3 transformer layers (batch=2, seq=3). The small matrix sizes [6, 3072] cannot saturate the GPU efficiently. The backbone is relatively efficient at ~2.6ms/layer for single-token decode with KV cache.

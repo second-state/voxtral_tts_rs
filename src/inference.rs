@@ -128,15 +128,16 @@ impl VoxtralTTS {
 
         // Prefill backbone
         let mut kv_cache = self.backbone.new_kv_cache();
+        let prefill_start = std::time::Instant::now();
         let mut hidden_state = self
             .backbone
             .forward_prefill_embeddings(&prefix_embeddings, &mut kv_cache);
-
-        tracing::debug!("Prefill done, KV cache seq_len={}", kv_cache.seq_len());
+        tracing::info!("Prefill: {:.2}s (seq_len={})", prefill_start.elapsed().as_secs_f64(), kv_cache.seq_len());
 
         // Autoregressive generation: produce audio frames
         let mut all_codes: Vec<Vec<i64>> = Vec::new();
         let max_frames = max_tokens / crate::TOKENS_PER_FRAME;
+        let gen_start = std::time::Instant::now();
 
         for frame_idx in 0..max_frames {
             // Generate one frame of 37 codes from the current hidden state
@@ -163,10 +164,13 @@ impl VoxtralTTS {
                 .forward_one_embedding(&next_embedding, &mut kv_cache);
 
             if frame_idx % 50 == 0 && frame_idx > 0 {
-                tracing::debug!(
-                    "Generated {} frames ({:.1}s)",
+                let elapsed = gen_start.elapsed().as_secs_f64();
+                tracing::info!(
+                    "Generated {} frames ({:.1}s audio) in {:.1}s ({:.2} frames/s)",
                     frame_idx,
-                    frame_idx as f64 / crate::FRAME_RATE as f64
+                    frame_idx as f64 / crate::FRAME_RATE as f64,
+                    elapsed,
+                    frame_idx as f64 / elapsed,
                 );
             }
         }

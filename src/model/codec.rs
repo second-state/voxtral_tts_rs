@@ -485,32 +485,25 @@ impl Codec {
         {
             // Conv: [B, T, D] → [B, D, T] → conv → [B, D', T'] → [B, T', D']
             let h_conv = h.transpose(1, 2); // [B, D, T]
-            tracing::debug!("Decoder block {} conv input: {:?}", i, h_conv.size());
             let h_conv = match conv {
                 DecoderConv::Conv1d(c) => c.forward(&h_conv),
                 DecoderConv::ConvTranspose1d(c) => c.forward(&h_conv),
             };
-            h_conv.eval();
-            tracing::debug!("Decoder block {} conv output: {:?}", i, h_conv.size());
             h = h_conv.transpose(1, 2); // [B, T', D']
 
             // Transformer layers
-            for (j, layer) in transformer_block.layers.iter().enumerate() {
+            for layer in &transformer_block.layers {
                 h = layer.forward(&h, &transformer_block.rotary_emb);
-                h.eval();
-                tracing::debug!(
-                    "Decoder block {} transformer {} output: {:?}",
-                    i,
-                    j,
-                    h.size()
-                );
             }
+            tracing::debug!("Decoder block {} done", i);
         }
 
         // Output projection: [B, T, D] → [B, D, T] → conv → [B, 240, T']
         let h = h.transpose(1, 2); // [B, D, T]
-        tracing::debug!("Decoder output proj input: {:?}", h.size());
-        self.output_proj.forward(&h)
+        let out = self.output_proj.forward(&h);
+        // Single eval materializes the entire decoder (4 conv+transformer blocks + output proj).
+        out.eval();
+        out
     }
 
     /// Encode a voice embedding directly (voice embeddings bypass the codec encoder).

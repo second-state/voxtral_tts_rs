@@ -178,23 +178,18 @@ impl Backbone {
 
         for (i, layer) in self.layers.iter().enumerate() {
             let (out, new_k, new_v) = layer.forward(&h, &self.rotary_emb, 0, kv_cache.get(i), true);
-            // Force evaluation after each layer to catch errors early
-            out.eval();
-            new_k.eval();
-            new_v.eval();
             kv_cache.update(i, new_k, new_v);
             h = out;
-            tracing::debug!("Layer {} done, h shape: {:?}", i, h.size());
         }
 
         let h = self.norm.forward(&h);
-        h.eval();
-        tracing::debug!("Norm done, h shape: {:?}", h.size());
         // Return last position hidden state: [1, seq_len, dim] → [dim]
         let last_pos = seq_len as i64 - 1;
         let out = h.select(1, last_pos).squeeze_dim(0);
+        // Single eval materializes the entire 26-layer prefill graph at once,
+        // allowing MLX to optimize the full computation on the GPU.
         out.eval();
-        tracing::debug!("Backbone prefill output shape: {:?}", out.size());
+        tracing::debug!("Backbone prefill done, output shape: {:?}", out.size());
         out
     }
 
@@ -212,15 +207,14 @@ impl Backbone {
         for (i, layer) in self.layers.iter().enumerate() {
             let (out, new_k, new_v) =
                 layer.forward(&h, &self.rotary_emb, pos, kv_cache.get(i), true);
-            // Force evaluation to prevent MLX lazy graph from growing unboundedly
-            out.eval();
-            new_k.eval();
-            new_v.eval();
             kv_cache.update(i, new_k, new_v);
             h = out;
         }
 
         let out = self.norm.forward(&h).squeeze_dim(0).squeeze_dim(0); // [dim]
+        // Single eval materializes the full 26-layer forward pass at once.
+        // MLX lazy evaluation lets the GPU optimize the entire graph together
+        // rather than synchronizing after each layer.
         out.eval();
         out
     }

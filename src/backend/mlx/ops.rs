@@ -524,14 +524,14 @@ pub fn fast_rope(
     x: &MlxArray,
     dims: i32,
     traditional: bool,
-    base: Option<&MlxArray>,
+    base: Option<f32>,
     scale: f32,
     offset: i32,
 ) -> MlxArray {
     let mut res = MlxArray::empty();
     let opt_base = match base {
-        Some(b) => ffi::mlx_optional_float {
-            value: b.item_f32(),
+        Some(v) => ffi::mlx_optional_float {
+            value: v,
             has_value: true,
         },
         None => ffi::mlx_optional_float {
