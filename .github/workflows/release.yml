@@ -74,9 +74,22 @@ jobs:
         if: matrix.backend == 'tch'
         run: tar xzf libtorch.tar.gz
 
+      - name: Install build dependencies (ARM Linux)
+        if: runner.arch == 'ARM64' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev
+
       - name: Set linker flags (Linux tch)
         if: matrix.backend == 'tch'
-        run: echo "RUSTFLAGS=-C link-arg=-Wl,-rpath-link,${{ github.workspace }}/libtorch/lib" >> "$GITHUB_ENV"
+        run: |
+          FLAGS="-C link-arg=-Wl,-rpath-link,${{ github.workspace }}/libtorch/lib"
+          # CUDA builds reference libcudart/libcupti which aren't on the CI runner;
+          # allow those to remain unresolved (they'll be present on deployment machines)
+          if [[ "${{ matrix.asset-name }}" == *cuda* ]]; then
+            FLAGS="$FLAGS -C link-arg=-Wl,--allow-shlib-undefined"
+          fi
+          echo "RUSTFLAGS=$FLAGS" >> "$GITHUB_ENV"
 
       - name: Build (tch)
         if: matrix.backend == 'tch'
