@@ -4,26 +4,7 @@ Rust port of [Voxtral-4B-TTS](https://huggingface.co/mistralai/Voxtral-4B-TTS-26
 
 ## Quick Start
 
-### 1. Download the model
-
-```bash
-mkdir -p models/voxtral-4b-tts/voice_embedding
-BASE_URL="https://huggingface.co/mistralai/Voxtral-4B-TTS-2603/resolve/main"
-
-# Model weights (8 GB), config, and tokenizer
-curl -L -o models/voxtral-4b-tts/consolidated.safetensors "${BASE_URL}/consolidated.safetensors"
-curl -L -o models/voxtral-4b-tts/params.json "${BASE_URL}/params.json"
-curl -L -o models/voxtral-4b-tts/tekken.json "${BASE_URL}/tekken.json"
-```
-
-Or use the download script:
-
-```bash
-git clone https://github.com/second-state/voxtral_tts_rs.git && cd voxtral_tts_rs
-bash scripts/download_model.sh
-```
-
-### 2. Download the release
+### 1. Download the release
 
 Download the platform-specific zip from [GitHub Releases](https://github.com/second-state/voxtral_tts_rs/releases):
 
@@ -39,20 +20,29 @@ Download the platform-specific zip from [GitHub Releases](https://github.com/sec
 # Example: macOS Apple Silicon
 curl -LO https://github.com/second-state/voxtral_tts_rs/releases/latest/download/voxtral-tts-macos-aarch64.zip
 unzip voxtral-tts-macos-aarch64.zip
+cd voxtral-tts-macos-aarch64
 ```
+
+### 2. Download the model
+
+```bash
+bash <(curl -sSf https://raw.githubusercontent.com/second-state/voxtral_tts_rs/main/scripts/download_model.sh)
+```
+
+This downloads `consolidated.safetensors` (8 GB), `params.json`, `tekken.json`, and 20 voice embeddings into `models/voxtral-4b-tts/`.
 
 ### 3. Copy voice embeddings to the model folder
 
 The release zip includes pre-converted voice embeddings (`.safetensors`). Copy them into the model directory:
 
 ```bash
-cp voxtral-tts-macos-aarch64/voice_embedding/*.safetensors models/voxtral-4b-tts/voice_embedding/
+cp voice_embedding/*.safetensors models/voxtral-4b-tts/voice_embedding/
 ```
 
 ### 4. Generate speech (CLI)
 
 ```bash
-./voxtral-tts-macos-aarch64/voxtral-tts models/voxtral-4b-tts \
+./voxtral-tts models/voxtral-4b-tts \
     --text "Hello, this is Voxtral TTS!" \
     --voice neutral_female \
     --output output.wav
@@ -61,7 +51,7 @@ cp voxtral-tts-macos-aarch64/voice_embedding/*.safetensors models/voxtral-4b-tts
 ### 5. Start the API server
 
 ```bash
-./voxtral-tts-macos-aarch64/voxtral-tts-server models/voxtral-4b-tts --port 8080
+./voxtral-tts-server models/voxtral-4b-tts --port 8080
 ```
 
 ```bash
@@ -224,9 +214,9 @@ cargo build --release --no-default-features --features mlx
 git clone https://github.com/second-state/voxtral_tts_rs.git
 cd voxtral_tts_rs
 
-# Download libtorch (pick one)
+# Download libtorch (auto-detects x86_64 or aarch64)
 bash scripts/download_libtorch.sh cpu      # CPU only
-bash scripts/download_libtorch.sh cu128    # CUDA 12.8
+bash scripts/download_libtorch.sh cuda     # CUDA 12.6
 
 # Build
 export LIBTORCH=$(pwd)/libtorch
