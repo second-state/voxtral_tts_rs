@@ -95,17 +95,26 @@ jobs:
       # ---------------------------------------------------------------
       # CLI tests
       # ---------------------------------------------------------------
+      # Note: macOS CI runners (M1) are ~60x slower than local M4 Max
+      # for MLX inference, so we use shorter text on macOS to stay
+      # within the 6h GitHub Actions timeout.
 
       - name: "CLI: Generate speech (English, neutral_female)"
         run: |
+          if [ "${{ matrix.backend }}" = "mlx" ]; then
+            TEXT="Hello."
+          else
+            TEXT="${{ inputs.text }}"
+          fi
           ./target/release/voxtral-tts models/voxtral-4b-tts \
-            --text "${{ inputs.text }}" \
+            --text "$TEXT" \
             --voice neutral_female \
             --output neutral_female_english.wav
           file neutral_female_english.wav
           ls -lh neutral_female_english.wav
 
       - name: "CLI: Generate speech (French, fr_female)"
+        if: matrix.backend != 'mlx'
         run: |
           ./target/release/voxtral-tts models/voxtral-4b-tts \
             --text "Bonjour! Ceci est un test du système Voxtral." \
@@ -115,7 +124,7 @@ jobs:
           ls -lh fr_female_french.wav
 
       - name: "CLI: Generate speech (custom voice via input)"
-        if: inputs.voice != 'neutral_female'
+        if: inputs.voice != 'neutral_female' && matrix.backend != 'mlx'
         run: |
           ./target/release/voxtral-tts models/voxtral-4b-tts \
             --text "${{ inputs.text }}" \
@@ -154,14 +163,20 @@ jobs:
 
       - name: "Server: POST /v1/audio/speech (alloy)"
         run: |
+          if [ "${{ matrix.backend }}" = "mlx" ]; then
+            INPUT="Hello."
+          else
+            INPUT="Hello from the API server."
+          fi
           curl -sf -X POST http://127.0.0.1:8090/v1/audio/speech \
             -H "Content-Type: application/json" \
-            -d '{"input":"Hello from the API server.","voice":"alloy","model":"voxtral-4b-tts"}' \
+            -d "{\"input\":\"$INPUT\",\"voice\":\"alloy\",\"model\":\"voxtral-4b-tts\"}" \
             -o api_alloy.wav
           file api_alloy.wav
           ls -lh api_alloy.wav
 
       - name: "Server: POST /v1/audio/speech (es_male)"
+        if: matrix.backend != 'mlx'
         run: |
           curl -sf -X POST http://127.0.0.1:8090/v1/audio/speech \
             -H "Content-Type: application/json" \
