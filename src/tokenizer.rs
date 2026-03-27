@@ -55,8 +55,9 @@ impl TekkenTokenizer {
     // Construction
     // --------------------------------------------------------------------
 
-    /// Load the tokenizer from a `tekken.json` file.
-    pub fn from_file(path: &Path) -> Result<Self> {
+    /// Load the tokenizer from a `tekken.json` file, capping to `max_vocab` entries.
+    /// If `max_vocab` is `None`, all entries are loaded.
+    pub fn from_file(path: &Path, max_vocab: Option<usize>) -> Result<Self> {
         let data = std::fs::read_to_string(path).map_err(|e| {
             VoxtralError::Tokenizer(format!("Failed to read {}: {}", path.display(), e))
         })?;
@@ -64,17 +65,24 @@ impl TekkenTokenizer {
         let parsed: TekkenJson = serde_json::from_str(&data)
             .map_err(|e| VoxtralError::Tokenizer(format!("Failed to parse tekken.json: {}", e)))?;
 
-        let entries = match parsed {
+        let mut entries = match parsed {
             TekkenJson::WithVocab { vocab } => vocab,
             TekkenJson::BareArray(arr) => arr,
         };
 
+        // Cap to model vocab size — tekken.json may have more entries than the
+        // model's embedding table (e.g. 150K entries vs 131072 embeddings).
+        if let Some(max) = max_vocab {
+            entries.sort_by_key(|e| e.rank);
+            entries.truncate(max);
+        }
+
         Self::from_entries(entries)
     }
 
-    /// Load the tokenizer from `<model_dir>/tekken.json`.
-    pub fn from_dir(model_dir: &Path) -> Result<Self> {
-        Self::from_file(&model_dir.join("tekken.json"))
+    /// Load the tokenizer from `<model_dir>/tekken.json`, capping to `max_vocab` entries.
+    pub fn from_dir(model_dir: &Path, max_vocab: Option<usize>) -> Result<Self> {
+        Self::from_file(&model_dir.join("tekken.json"), max_vocab)
     }
 
     /// Build internal data structures from parsed vocabulary entries.

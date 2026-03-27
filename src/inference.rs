@@ -44,8 +44,8 @@ impl VoxtralTTS {
             config.vocab_size,
         );
 
-        // Load tokenizer
-        let tokenizer = TekkenTokenizer::from_dir(model_dir)?;
+        // Load tokenizer (cap to model vocab_size to avoid OOB on tok_embeddings)
+        let tokenizer = TekkenTokenizer::from_dir(model_dir, Some(config.vocab_size))?;
         tracing::info!("Tokenizer loaded ({} tokens)", tokenizer.vocab_size());
 
         // Load voice embeddings
