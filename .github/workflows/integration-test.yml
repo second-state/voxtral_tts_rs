@@ -93,14 +93,6 @@ jobs:
           "
 
       # ---------------------------------------------------------------
-      # Set runtime library paths
-      # ---------------------------------------------------------------
-
-      - name: Set library path (Linux)
-        if: runner.os == 'Linux' && matrix.backend == 'tch'
-        run: echo "LD_LIBRARY_PATH=${{ github.workspace }}/libtorch/lib:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
-
-      # ---------------------------------------------------------------
       # CLI tests
       # ---------------------------------------------------------------
 

@@ -12,20 +12,30 @@ fn main() {
     build_mlx();
 }
 
-/// Embed the libtorch library path as RPATH so the binary can find libTorch at runtime.
+/// Embed libtorch RPATH so the binary finds shared libs at runtime without LD_LIBRARY_PATH.
+///
+/// Two RPATHs are embedded:
+/// 1. Relative to the binary (`$ORIGIN/../libtorch/lib`) — for deployed layouts
+/// 2. Absolute from `$LIBTORCH` env var (if set) — for the build-time location
 #[cfg(feature = "tch-backend")]
 fn setup_libtorch_rpath() {
-    // Use LIBTORCH env var if set, otherwise default to ../libtorch relative to binary
+    // Always embed a relative RPATH so deployed binaries work without LD_LIBRARY_PATH
+    #[cfg(target_os = "linux")]
+    {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../libtorch/lib");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../libtorch/lib");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../lib");
+    }
+
+    // Also embed the absolute build-time path so tests/CI work in-tree
     if let Ok(libtorch_path) = std::env::var("LIBTORCH") {
         let lib_dir = format!("{}/lib", libtorch_path);
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir);
-    } else {
-        // Fallback: look for libtorch relative to the binary location
-        #[cfg(target_os = "linux")]
-        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../libtorch/lib");
-
-        #[cfg(target_os = "macos")]
-        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../libtorch/lib");
     }
 }
 

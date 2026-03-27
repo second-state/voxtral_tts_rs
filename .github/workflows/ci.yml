@@ -73,16 +73,11 @@ jobs:
         env:
           LIBTORCH: ${{ github.workspace }}/libtorch
           LIBTORCH_BYPASS_VERSION_CHECK: "1"
-          LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
         run: cargo test --release
 
       - name: Run unit tests (MLX)
         if: matrix.backend == 'mlx'
         run: cargo test --release --no-default-features --features mlx
-
-      - name: Set library path (Linux tch)
-        if: runner.os == 'Linux' && matrix.backend == 'tch'
-        run: echo "LD_LIBRARY_PATH=${{ github.workspace }}/libtorch/lib:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
 
       - name: Smoke test - CLI prints help
         run: ./target/release/voxtral-tts --help
