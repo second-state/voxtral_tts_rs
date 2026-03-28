@@ -179,15 +179,24 @@ impl FlowMatchingTransformer {
             *v = -1e9; // padding beyond valid range
         }
 
-        // Log END_AUDIO logit diagnostics for first few calls (helps debug EOS issues)
+        // Log semantic logit diagnostics (helps debug EOS / degenerate code issues)
         {
             let eos_logit = logits_vec[crate::END_AUDIO_TOKEN_ID as usize];
-            let (max_idx, max_val) = logits_vec.iter().enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .unwrap_or((0, &0.0));
+            // Find top-5 logits with indices
+            let mut indexed: Vec<(usize, f32)> = logits_vec.iter().enumerate()
+                .map(|(i, &v)| (i, v))
+                .collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top5: Vec<_> = indexed.iter().take(5).collect();
+            let logit_mean: f32 = logits_vec.iter().sum::<f32>() / logits_vec.len() as f32;
+            let logit_std: f32 = (logits_vec.iter().map(|v| (v - logit_mean).powi(2)).sum::<f32>()
+                / logits_vec.len() as f32).sqrt();
             tracing::info!(
-                "Semantic logits: END_AUDIO[1]={:.4}, argmax[{}]={:.4}, gap={:.4}",
-                eos_logit, max_idx, max_val, max_val - eos_logit,
+                "Semantic: EOS[1]={:.4}, top5=[{}], mean={:.4}, std={:.4}",
+                eos_logit,
+                top5.iter().map(|(i, v)| format!("{}:{:.3}", i, v)).collect::<Vec<_>>().join(", "),
+                logit_mean,
+                logit_std,
             );
         }
 

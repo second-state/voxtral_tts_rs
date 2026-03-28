@@ -439,7 +439,10 @@ impl Attention {
                     (k, v)
                 };
 
-                // GQA expansion may produce non-contiguous tensors; make contiguous for matmul
+                // Make all tensors contiguous for matmul:
+                // - Q: non-contiguous after reshape+transpose(1,2)
+                // - K, V: non-contiguous after GQA repeat_kv (expand+reshape)
+                let q = q.contiguous();
                 let k = k.contiguous();
                 let v = v.contiguous();
 
@@ -540,6 +543,7 @@ impl Attention {
                     (k, v)
                 };
 
+                let q = q.contiguous();
                 let k = k.contiguous();
                 let v = v.contiguous();
 
