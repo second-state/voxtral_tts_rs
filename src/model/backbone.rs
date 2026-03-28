@@ -228,15 +228,15 @@ impl Backbone {
     ///
     /// Each code is looked up in the audio codebook embedding table at its
     /// codebook-specific offset, and all 37 embeddings are summed together.
-    /// The text embedding for `audio_token_id` is also added (sum embedding).
     ///
     /// * `codes` – slice of 37 codes: [semantic_code, acoustic_code_0, ..., acoustic_code_35].
     pub fn embed_audio_codes(&self, codes: &[i64]) -> Tensor {
-        // Start with the text embedding for the audio marker token
-        let mut sum = self.tok_embeddings.select(0, crate::AUDIO_TOKEN_ID);
+        // Sum codebook embeddings (no AUDIO token embedding added - that's only
+        // used for the initial decode step, not per-frame embedding)
+        let first_idx = self.codebook_offsets[0] + codes[0];
+        let mut sum = self.audio_codebook_embeddings.select(0, first_idx);
 
-        // Add each codebook embedding
-        for (i, &code) in codes.iter().enumerate() {
+        for (i, &code) in codes.iter().enumerate().skip(1) {
             let idx = self.codebook_offsets[i] + code;
             let emb = self.audio_codebook_embeddings.select(0, idx);
             sum = &sum + &emb;

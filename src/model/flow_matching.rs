@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use crate::config::AcousticTransformerConfig;
 use crate::tensor::{DType, Device, Tensor};
 
-use super::layers::{Linear, RMSNorm, RotaryEmbedding, TransformerLayer};
+use super::layers::{Linear, RMSNorm, TransformerLayer};
 
 /// Number of Euler ODE integration steps.
 const NUM_EULER_STEPS: usize = 8;
@@ -51,8 +51,6 @@ pub struct FlowMatchingTransformer {
     semantic_codebook_output: Linear,
     /// Final RMSNorm.
     norm: RMSNorm,
-    /// Rotary embedding for the 3-token bidirectional attention.
-    rotary_emb: RotaryEmbedding,
     /// Pre-computed time step projections for all Euler steps (constant across frames).
     time_step_projs: Vec<Tensor>,
     /// Configuration.
@@ -121,13 +119,6 @@ impl FlowMatchingTransformer {
             layers.push(layer);
         }
 
-        let rotary_emb = RotaryEmbedding::new(
-            config.head_dim,
-            64, // only need 3 positions max
-            config.rope_theta,
-            device,
-        );
-
         // Pre-compute time step projections (constant for all frames).
         // These are sinusoidal embeddings projected through time_projection for each Euler step.
         let time_step_projs: Vec<Tensor> = (0..(NUM_EULER_STEPS - 1))
@@ -148,7 +139,6 @@ impl FlowMatchingTransformer {
             acoustic_codebook_output,
             semantic_codebook_output,
             norm,
-            rotary_emb,
             time_step_projs,
             config,
         }
@@ -166,32 +156,34 @@ impl FlowMatchingTransformer {
     /// Returns `None` if end-of-audio is predicted.
     pub fn generate_frame(&self, llm_hidden: &Tensor, device: Device) -> Option<Vec<i64>> {
         // 1. Predict semantic code from LLM hidden state
-        let llm_input = llm_hidden.unsqueeze(0); // [1, dim]
+        // Cast to F32 for precision (matches mlx-audio and C reference which compute
+        // semantic logits in F32: the [1, 3072] × [8320, 3072]^T matmul needs F32
+        // accumulation to correctly distinguish END_AUDIO from valid codes)
+        let llm_input = llm_hidden.unsqueeze(0).to_dtype(DType::Float32); // [1, dim] F32
         let semantic_logits = self.semantic_codebook_output.forward(&llm_input);
         let semantic_logits = semantic_logits.squeeze_dim(0); // [codebook_size]
 
-        // Mask: set end-of-audio and padding to -inf
+        // Mask: set empty-audio to -1e9, but allow end-of-audio to be predicted
+        // Index 0 = EMPTY_AUDIO (never valid), Index 1 = END_AUDIO (signals stop)
         // Valid semantic codes are in [2, 2 + 8192) = [2, 8194)
         let mut logits_vec = semantic_logits.to_vec_f32();
-        // Mask special tokens (0, 1) and padding (>= 8194)
+        // Mask only EMPTY_AUDIO (index 0); END_AUDIO (index 1) must remain
+        // unmasked so the model can signal end-of-generation naturally.
         if !logits_vec.is_empty() {
-            logits_vec[0] = f32::NEG_INFINITY; // end-of-audio
-        }
-        if logits_vec.len() > 1 {
-            logits_vec[1] = f32::NEG_INFINITY; // padding
+            logits_vec[0] = -1e9; // empty-audio (never predict)
         }
         for v in logits_vec
             .iter_mut()
             .skip(crate::NUM_AUDIO_SPECIAL_TOKENS + crate::SEMANTIC_CODEBOOK_SIZE)
         {
-            *v = f32::NEG_INFINITY; // padding beyond valid range
+            *v = -1e9; // padding beyond valid range
         }
 
         let semantic_logits = Tensor::from_slice_f32(&logits_vec).to_device(device);
         let semantic_code = semantic_logits.argmax(0, false).int64_value(&[]);
 
-        // Check for end-of-audio
-        if semantic_code == crate::END_AUDIO_TOKEN_ID {
+        // Check for end-of-audio (0=empty_audio, 1=end_audio — both signal stop)
+        if semantic_code <= crate::END_AUDIO_TOKEN_ID {
             return None;
         }
 
@@ -287,11 +279,10 @@ impl FlowMatchingTransformer {
         ); // [1, 3, dim]
         let h = Tensor::cat(&[seq_cond, seq_uncond], 0); // [2, 3, dim]
 
-        // Forward through bidirectional transformer layers (no causal mask)
+        // Forward through bidirectional transformer layers (no causal mask, no RoPE)
         let mut h = h;
         for layer in &self.layers {
-            let (out, _k, _v) = layer.forward(&h, &self.rotary_emb, 0, None, false);
-            h = out;
+            h = layer.forward_no_rope(&h, false);
         }
 
         // Norm and take output from position 0 (the acoustic token)
@@ -317,8 +308,8 @@ fn sinusoidal_time_embedding(t: f64, dim: usize, device: Device) -> Tensor {
     for i in 0..half_dim {
         let freq = (-log_10000 * i as f64 / half_dim as f64).exp();
         let angle = t * freq;
-        emb[i] = angle.sin() as f32;
-        emb[i + half_dim] = angle.cos() as f32;
+        emb[i] = angle.cos() as f32;
+        emb[i + half_dim] = angle.sin() as f32;
     }
 
     Tensor::from_slice_f32(&emb)

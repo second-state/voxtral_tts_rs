@@ -111,6 +111,12 @@ pub struct AudioTokenizerConfig {
     /// Whether to use weight normalization on convolutions.
     #[serde(default)]
     pub conv_weight_norm: bool,
+    /// Norm epsilon for attention_norm and ffn_norm (separate from qk_norm_eps).
+    #[serde(default = "default_codec_norm_eps")]
+    pub norm_eps: f64,
+    /// Whether attention is causal.
+    #[serde(default = "default_codec_causal")]
+    pub causal: bool,
     /// Attention sliding window size.
     #[serde(default)]
     pub attn_sliding_window_size: usize,
@@ -192,6 +198,14 @@ fn default_acoustic_dim() -> usize {
 
 fn default_qk_norm_eps() -> f64 {
     1e-6
+}
+
+fn default_codec_norm_eps() -> f64 {
+    0.01
+}
+
+fn default_codec_causal() -> bool {
+    true
 }
 
 /// Audio model configuration (backbone extensions for audio).
@@ -317,6 +331,8 @@ impl VoxtralConfig {
                 layer_scale: true,
                 layer_scale_init: 0.01,
                 conv_weight_norm: true,
+                norm_eps: 0.01,
+                causal: true,
                 attn_sliding_window_size: 16,
                 decoder_transformer_lengths: vec![2, 2, 2, 2],
                 decoder_conv_kernels: vec![3, 4, 4, 4],

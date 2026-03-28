@@ -92,47 +92,56 @@ impl VoxtralTTS {
 
         // Tokenize text
         let text_tokens: Vec<u32> = self.tokenizer.encode(text);
-        tracing::debug!("Text tokens: {} tokens", text_tokens.len());
+        tracing::debug!("Text tokens: {} tokens: {:?}", text_tokens.len(), text_tokens);
 
-        // Build input embedding sequence:
-        // [text_token_embeddings..., begin_audio_token, voice_embeddings...]
-        let total_prefix_len = text_tokens.len() + 1 + n_voice_frames; // text + begin_audio + voice
+        // Build input embedding sequence (Voxtral TTS format):
+        // [BOS] [BEGIN_AUDIO] voice_embeddings... [NEXT_AUDIO_TEXT] text_tokens [REPEAT_AUDIO_TEXT] [BEGIN_AUDIO]
+        let total_prefix_len = 2 + n_voice_frames + 1 + text_tokens.len() + 2;
         let mut embeddings_data = Vec::with_capacity(total_prefix_len);
 
+        // [BOS]
+        embeddings_data.push(self.backbone.embed_text_token(crate::BOS_TOKEN_ID));
+        // [BEGIN_AUDIO]
+        embeddings_data.push(self.backbone.embed_text_token(crate::BEGIN_AUDIO_TOKEN_ID));
+        // Voice embeddings (pre-computed backbone hidden states, directly injected)
+        for i in 0..n_voice_frames {
+            embeddings_data.push(voice_embedding.select(0, i as i64));
+        }
+        // [NEXT_AUDIO_TEXT]
+        embeddings_data.push(self.backbone.embed_text_token(crate::NEXT_AUDIO_TEXT_TOKEN_ID));
         // Text token embeddings
         for &token_id in &text_tokens {
-            let emb = self.backbone.embed_text_token(token_id as i64);
-            embeddings_data.push(emb);
+            embeddings_data.push(self.backbone.embed_text_token(token_id as i64));
         }
-
-        // Begin-audio token embedding
-        let begin_audio_emb = self.backbone.embed_text_token(crate::BEGIN_AUDIO_TOKEN_ID);
-        embeddings_data.push(begin_audio_emb);
-
-        // Voice embeddings (pre-computed, directly injected)
-        for i in 0..n_voice_frames {
-            let frame_emb = voice_embedding.select(0, i as i64); // [dim]
-            embeddings_data.push(frame_emb);
-        }
+        // [REPEAT_AUDIO_TEXT]
+        embeddings_data.push(self.backbone.embed_text_token(crate::REPEAT_AUDIO_TEXT_TOKEN_ID));
+        // [BEGIN_AUDIO] (signals start of audio generation)
+        embeddings_data.push(self.backbone.embed_text_token(crate::BEGIN_AUDIO_TOKEN_ID));
 
         // Stack into [1, total_prefix_len, dim]
-        let prefix_embeddings = Tensor::stack(&embeddings_data, 0) // [total_prefix_len, dim]
-            .unsqueeze(0); // [1, total_prefix_len, dim]
+        let prefix_embeddings = Tensor::stack(&embeddings_data, 0)
+            .unsqueeze(0);
 
         tracing::debug!(
-            "Prefix: {} tokens (text={}, voice={})",
+            "Prefix: {} tokens (voice={}, text={})",
             total_prefix_len,
-            text_tokens.len() + 1,
-            n_voice_frames
+            n_voice_frames,
+            text_tokens.len()
         );
 
         // Prefill backbone
         let mut kv_cache = self.backbone.new_kv_cache();
         let prefill_start = std::time::Instant::now();
-        let mut hidden_state = self
-            .backbone
+        self.backbone
             .forward_prefill_embeddings(&prefix_embeddings, &mut kv_cache);
         tracing::info!("Prefill: {:.2}s (seq_len={})", prefill_start.elapsed().as_secs_f64(), kv_cache.seq_len());
+
+        // First decode step: feed AUDIO token to get first hidden state
+        // (matches reference: prefill ends with BEGIN_AUDIO, then AUDIO token starts generation)
+        let audio_embed = self.backbone.embed_text_token(crate::AUDIO_TOKEN_ID);
+        let mut hidden_state = self
+            .backbone
+            .forward_one_embedding(&audio_embed, &mut kv_cache);
 
         // Autoregressive generation: produce audio frames
         let mut all_codes: Vec<Vec<i64>> = Vec::new();
@@ -147,7 +156,7 @@ impl VoxtralTTS {
             {
                 Some(codes) => codes,
                 None => {
-                    tracing::debug!("End-of-audio at frame {}", frame_idx);
+                    tracing::info!("End-of-audio at frame {}", frame_idx);
                     break;
                 }
             };
@@ -229,29 +238,39 @@ impl VoxtralTTS {
         let n_voice_frames = voice_shape[0] as usize;
 
         let text_tokens: Vec<u32> = self.tokenizer.encode(text);
-        let total_prefix_len = text_tokens.len() + 1 + n_voice_frames;
+        // [BOS] [BEGIN_AUDIO] voice_embeddings... [NEXT_AUDIO_TEXT] text_tokens [REPEAT_AUDIO_TEXT] [BEGIN_AUDIO]
+        let total_prefix_len = 2 + n_voice_frames + 1 + text_tokens.len() + 2;
         let mut embeddings_data = Vec::with_capacity(total_prefix_len);
 
-        for &token_id in &text_tokens {
-            embeddings_data.push(self.backbone.embed_text_token(token_id as i64));
-        }
+        embeddings_data.push(self.backbone.embed_text_token(crate::BOS_TOKEN_ID));
         embeddings_data.push(self.backbone.embed_text_token(crate::BEGIN_AUDIO_TOKEN_ID));
         for i in 0..n_voice_frames {
             embeddings_data.push(voice_embedding.select(0, i as i64));
         }
+        embeddings_data.push(self.backbone.embed_text_token(crate::NEXT_AUDIO_TEXT_TOKEN_ID));
+        for &token_id in &text_tokens {
+            embeddings_data.push(self.backbone.embed_text_token(token_id as i64));
+        }
+        embeddings_data.push(self.backbone.embed_text_token(crate::REPEAT_AUDIO_TEXT_TOKEN_ID));
+        embeddings_data.push(self.backbone.embed_text_token(crate::BEGIN_AUDIO_TOKEN_ID));
 
         let prefix_embeddings = Tensor::stack(&embeddings_data, 0).unsqueeze(0);
 
         let mut kv_cache = self.backbone.new_kv_cache();
         let prefill_start = std::time::Instant::now();
-        let mut hidden_state = self
-            .backbone
+        self.backbone
             .forward_prefill_embeddings(&prefix_embeddings, &mut kv_cache);
         tracing::info!(
             "Prefill: {:.2}s (seq_len={})",
             prefill_start.elapsed().as_secs_f64(),
             kv_cache.seq_len()
         );
+
+        // First decode step: feed AUDIO token to get first hidden state
+        let audio_embed = self.backbone.embed_text_token(crate::AUDIO_TOKEN_ID);
+        let mut hidden_state = self
+            .backbone
+            .forward_one_embedding(&audio_embed, &mut kv_cache);
 
         let max_frames = max_tokens / crate::TOKENS_PER_FRAME;
         let gen_start = std::time::Instant::now();

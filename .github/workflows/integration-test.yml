@@ -246,19 +246,61 @@ jobs:
           [ "$STATUS" = "400" ] || (echo "Expected 400, got $STATUS"; exit 1)
 
       - name: "Server: Streaming SSE"
-        if: matrix.backend != 'mlx'
         run: |
+          # MLX CI runners are ~60x slower; allow up to 2 hours
+          if [ "${{ matrix.backend }}" = "mlx" ]; then
+            MAX_TIME=7200
+          else
+            MAX_TIME=300
+          fi
           curl -sN -X POST http://127.0.0.1:8090/v1/audio/speech \
             -H "Content-Type: application/json" \
             -d '{"input":"Hello.","voice":"alloy","stream":true}' \
-            --max-time 300 \
+            --max-time "$MAX_TIME" \
             -o sse_output.txt || true
           echo "--- SSE output (first 500 chars) ---"
           head -c 500 sse_output.txt
           echo ""
           grep -q "speech.audio.delta" sse_output.txt || (echo "Missing speech.audio.delta"; exit 1)
           grep -q "speech.audio.done" sse_output.txt || (echo "Missing speech.audio.done"; exit 1)
-          echo "Streaming test passed"
+          echo "Streaming SSE test passed"
+
+          # Decode base64 PCM chunks from SSE events into a playable WAV file
+          python3 -c "
+          import base64, struct, json, re
+
+          raw_pcm = b''
+          with open('sse_output.txt') as f:
+              for line in f:
+                  line = line.strip()
+                  if not line.startswith('data:'):
+                      continue
+                  payload = json.loads(line[len('data:'):].strip())
+                  if payload.get('type') == 'speech.audio.delta':
+                      raw_pcm += base64.b64decode(payload['delta'])
+
+          assert len(raw_pcm) > 0, 'No PCM data decoded from SSE stream'
+          print(f'Decoded {len(raw_pcm)} bytes of PCM from SSE stream')
+
+          # Wrap raw 24kHz 16-bit mono PCM in a WAV header
+          sample_rate = 24000
+          channels = 1
+          bits = 16
+          data_size = len(raw_pcm)
+          with open('api_streaming.wav', 'wb') as out:
+              out.write(b'RIFF')
+              out.write(struct.pack('<I', 36 + data_size))
+              out.write(b'WAVE')
+              out.write(b'fmt ')
+              out.write(struct.pack('<IHHIIHH', 16, 1, channels, sample_rate,
+                                   sample_rate * channels * bits // 8, channels * bits // 8, bits))
+              out.write(b'data')
+              out.write(struct.pack('<I', data_size))
+              out.write(raw_pcm)
+          print('Wrote api_streaming.wav')
+          "
+          file api_streaming.wav
+          ls -lh api_streaming.wav
 
       - name: "Server: Stop"
         if: always()
@@ -279,6 +321,7 @@ jobs:
             *.flac
             *.ogg
             *.pcm
+            sse_output.txt
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4

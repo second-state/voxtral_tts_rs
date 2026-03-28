@@ -1,7 +1,9 @@
 //! Pure Rust implementation of the Tekken BPE tokenizer.
 //!
-//! Loads from `tekken.json` which contains a vocabulary of 131,072 tokens
-//! with base64-encoded byte sequences and merge ranks.
+//! Loads from `tekken.json` which contains BPE vocabulary entries, special tokens,
+//! and configuration. BPE token IDs are offset by `num_special_tokens` so that
+//! special/control tokens occupy IDs 0..(num_special_tokens-1) and BPE tokens
+//! start at `num_special_tokens`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -21,24 +23,45 @@ struct VocabEntry {
     // There may be other fields like `token_str`; we ignore them.
 }
 
+/// Config section of tekken.json (v7).
+#[derive(Debug, Deserialize)]
+struct TekkenConfig {
+    #[serde(default = "default_num_special")]
+    default_num_special_tokens: usize,
+    #[serde(default)]
+    default_vocab_size: usize,
+}
+
+fn default_num_special() -> usize {
+    0
+}
+
+/// Full tekken.json with config, vocab, and special_tokens.
+#[derive(Debug, Deserialize)]
+struct TekkenJsonFull {
+    #[serde(default)]
+    config: Option<TekkenConfig>,
+    vocab: Vec<VocabEntry>,
+}
+
 /// Wrapper to handle both possible top-level JSON formats.
 ///
-/// Format A: `{ "vocab": [ ... ] }`
+/// Format A: `{ "config": ..., "vocab": [...], "special_tokens": [...] }`
 /// Format B: bare array `[ ... ]`
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum TekkenJson {
-    /// Object with a `vocab` key containing the entry array.
-    WithVocab { vocab: Vec<VocabEntry> },
-    /// Bare array of entries.
+    /// Object with config and vocab keys.
+    Full(TekkenJsonFull),
+    /// Bare array of entries (legacy format).
     BareArray(Vec<VocabEntry>),
 }
 
 /// Pure-Rust Tekken BPE tokenizer.
 pub struct TekkenTokenizer {
-    /// Encode: byte sequence -> token ID.
-    token_to_id: HashMap<Vec<u8>, u32>,
-    /// Decode: token ID -> byte sequence.
+    /// Encode: byte sequence -> BPE rank (internal, before offset).
+    token_to_rank: HashMap<Vec<u8>, u32>,
+    /// Decode: final token ID -> byte sequence.
     id_to_bytes: Vec<Option<Vec<u8>>>,
     /// BPE merge pairs ordered by rank (index 0 = highest priority).
     /// Each entry is `(left_bytes, right_bytes)`.
@@ -46,7 +69,9 @@ pub struct TekkenTokenizer {
     merges: Vec<(Vec<u8>, Vec<u8>)>,
     /// Reverse lookup: merged pair -> rank (lower = higher priority).
     merge_rank: HashMap<(Vec<u8>, Vec<u8>), usize>,
-    /// Total vocabulary size.
+    /// Number of special tokens that precede BPE tokens in the model vocab.
+    num_special_tokens: u32,
+    /// Total vocabulary size (special + BPE).
     vocab_size: usize,
 }
 
@@ -65,19 +90,32 @@ impl TekkenTokenizer {
         let parsed: TekkenJson = serde_json::from_str(&data)
             .map_err(|e| VoxtralError::Tokenizer(format!("Failed to parse tekken.json: {}", e)))?;
 
-        let mut entries = match parsed {
-            TekkenJson::WithVocab { vocab } => vocab,
-            TekkenJson::BareArray(arr) => arr,
+        let (mut entries, num_special) = match parsed {
+            TekkenJson::Full(full) => {
+                let num_special = full
+                    .config
+                    .as_ref()
+                    .map(|c| c.default_num_special_tokens)
+                    .unwrap_or(0);
+                (full.vocab, num_special)
+            }
+            TekkenJson::BareArray(arr) => (arr, 0),
         };
 
-        // Cap to model vocab size — tekken.json may have more entries than the
-        // model's embedding table (e.g. 150K entries vs 131072 embeddings).
+        // Cap BPE entries so total (special + BPE) fits within max_vocab.
         if let Some(max) = max_vocab {
             entries.sort_by_key(|e| e.rank);
-            entries.truncate(max);
+            let max_bpe = max.saturating_sub(num_special);
+            entries.truncate(max_bpe);
         }
 
-        Self::from_entries(entries)
+        tracing::info!(
+            "Tekken tokenizer: {} BPE tokens, {} special tokens (offset)",
+            entries.len(),
+            num_special,
+        );
+
+        Self::from_entries(entries, num_special as u32)
     }
 
     /// Load the tokenizer from `<model_dir>/tekken.json`, capping to `max_vocab` entries.
@@ -86,25 +124,25 @@ impl TekkenTokenizer {
     }
 
     /// Build internal data structures from parsed vocabulary entries.
-    fn from_entries(mut entries: Vec<VocabEntry>) -> Result<Self> {
+    fn from_entries(mut entries: Vec<VocabEntry>, num_special_tokens: u32) -> Result<Self> {
         let engine = base64::engine::general_purpose::STANDARD;
 
         // Sort entries by rank (ascending) so that index == priority order.
         entries.sort_by_key(|e| e.rank);
 
-        let vocab_size = entries.len();
+        let bpe_count = entries.len();
+        let total_vocab = num_special_tokens as usize + bpe_count;
 
-        // Pre-allocate decode table.
-        let mut id_to_bytes: Vec<Option<Vec<u8>>> = vec![None; vocab_size];
-        let mut token_to_id: HashMap<Vec<u8>, u32> = HashMap::with_capacity(vocab_size);
+        // Pre-allocate decode table (indexed by final token ID).
+        let mut id_to_bytes: Vec<Option<Vec<u8>>> = vec![None; total_vocab];
+        // BPE internal mapping: byte sequence -> BPE rank (0-based, before offset)
+        let mut token_to_rank: HashMap<Vec<u8>, u32> = HashMap::with_capacity(bpe_count);
 
-        // First 256 entries (ranks 0..255) are typically the raw byte tokens.
-        // Entries beyond that are merge results; we derive merge pairs from them.
         let mut merges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut merge_rank: HashMap<(Vec<u8>, Vec<u8>), usize> = HashMap::new();
 
-        // Collect all token byte sequences keyed by rank (== token ID).
-        let mut rank_to_bytes: Vec<Vec<u8>> = Vec::with_capacity(vocab_size);
+        // Collect all token byte sequences keyed by BPE rank.
+        let mut rank_to_bytes: Vec<Vec<u8>> = Vec::with_capacity(bpe_count);
 
         for entry in &entries {
             let bytes = engine.decode(&entry.token_bytes).map_err(|e| {
@@ -116,11 +154,14 @@ impl TekkenTokenizer {
             rank_to_bytes.push(bytes);
         }
 
-        // Populate forward / reverse maps using rank as token ID.
-        for (idx, bytes) in rank_to_bytes.iter().enumerate() {
-            let id = idx as u32;
-            id_to_bytes[idx] = Some(bytes.clone());
-            token_to_id.insert(bytes.clone(), id);
+        // Populate forward / reverse maps.
+        // BPE rank `r` maps to final token ID `r + num_special_tokens`.
+        for (rank, bytes) in rank_to_bytes.iter().enumerate() {
+            let final_id = rank as u32 + num_special_tokens;
+            if (final_id as usize) < id_to_bytes.len() {
+                id_to_bytes[final_id as usize] = Some(bytes.clone());
+            }
+            token_to_rank.insert(bytes.clone(), rank as u32);
         }
 
         // Build merge table. For every token whose byte sequence is >1 byte
@@ -131,16 +172,15 @@ impl TekkenTokenizer {
                 continue;
             }
 
-            // Try all possible split points and pick the one where both halves
-            // are known tokens with the maximum combined rank being minimised.
-            let mut best_split: Option<(usize, u32)> = None; // (split_pos, max_rank_of_halves)
+            let mut best_split: Option<(usize, u32)> = None;
 
             for split in 1..bytes.len() {
                 let left = &bytes[..split];
                 let right = &bytes[split..];
 
-                if let (Some(&lid), Some(&rid)) = (token_to_id.get(left), token_to_id.get(right)) {
-                    // Both halves must have strictly lower rank (== earlier in vocab).
+                if let (Some(&lid), Some(&rid)) =
+                    (token_to_rank.get(left), token_to_rank.get(right))
+                {
                     if (lid as usize) < idx && (rid as usize) < idx {
                         let worst = lid.max(rid);
                         if best_split.is_none() || worst < best_split.unwrap().1 {
@@ -160,17 +200,20 @@ impl TekkenTokenizer {
         }
 
         tracing::debug!(
-            "Tokenizer loaded: {} tokens, {} merges",
-            vocab_size,
+            "Tokenizer loaded: {} BPE tokens + {} special = {} total, {} merges",
+            bpe_count,
+            num_special_tokens,
+            total_vocab,
             merges.len()
         );
 
         Ok(Self {
-            token_to_id,
+            token_to_rank,
             id_to_bytes,
             merges,
             merge_rank,
-            vocab_size,
+            num_special_tokens,
+            vocab_size: total_vocab,
         })
     }
 
@@ -180,13 +223,7 @@ impl TekkenTokenizer {
 
     /// Encode `text` to a sequence of token IDs using BPE.
     ///
-    /// Algorithm:
-    /// 1. Convert the text to its UTF-8 byte representation.
-    /// 2. Start with each byte as its own token (byte tokens are assumed to
-    ///    be the first 256 entries in the vocabulary).
-    /// 3. Iteratively merge the adjacent pair with the lowest merge rank
-    ///    (highest priority) until no more merges are possible.
-    /// 4. Map the resulting byte sequences to their token IDs.
+    /// Returns final token IDs (BPE ranks + num_special_tokens offset).
     pub fn encode(&self, text: &str) -> Vec<u32> {
         if text.is_empty() {
             return Vec::new();
@@ -246,14 +283,12 @@ impl TekkenTokenizer {
             segments = new_segments;
         }
 
-        // Map segments to token IDs.
+        // Map segments to final token IDs (BPE rank + offset).
+        let offset = self.num_special_tokens;
         segments
             .iter()
             .map(|seg| {
-                self.token_to_id.get(seg).copied().unwrap_or_else(|| {
-                    // Fallback: encode as individual byte tokens.
-                    // This should not happen if the vocab is complete, but
-                    // it prevents panics.
+                self.token_to_rank.get(seg).copied().map(|r| r + offset).unwrap_or_else(|| {
                     tracing::warn!("Token not found for byte sequence of length {}", seg.len());
                     0
                 })
@@ -288,7 +323,7 @@ impl TekkenTokenizer {
     // Accessors
     // --------------------------------------------------------------------
 
-    /// Return the vocabulary size.
+    /// Return the vocabulary size (special + BPE).
     pub fn vocab_size(&self) -> usize {
         self.vocab_size
     }
@@ -302,7 +337,7 @@ mod tests {
     /// (for ASCII text that maps cleanly to byte tokens).
     #[test]
     fn test_byte_level_roundtrip() {
-        // Build a minimal tokenizer with only byte tokens (no merges).
+        // Build a minimal tokenizer with only byte tokens (no merges), no offset.
         let mut entries = Vec::new();
         for i in 0u32..256 {
             let token_bytes = base64::engine::general_purpose::STANDARD.encode([i as u8]);
@@ -311,12 +346,31 @@ mod tests {
                 token_bytes,
             });
         }
-        let tok = TekkenTokenizer::from_entries(entries).unwrap();
+        let tok = TekkenTokenizer::from_entries(entries, 0).unwrap();
 
         let text = "hello world";
         let ids = tok.encode(text);
         assert_eq!(ids.len(), text.len());
         let decoded = tok.decode(&ids);
         assert_eq!(decoded, text);
+    }
+
+    /// Test that BPE token IDs include the special token offset.
+    #[test]
+    fn test_special_token_offset() {
+        let mut entries = Vec::new();
+        for i in 0u32..256 {
+            let token_bytes = base64::engine::general_purpose::STANDARD.encode([i as u8]);
+            entries.push(VocabEntry {
+                rank: i,
+                token_bytes,
+            });
+        }
+        let tok = TekkenTokenizer::from_entries(entries, 1000).unwrap();
+
+        // 'A' = 0x41 = 65, with offset 1000 should be 1065
+        let ids = tok.encode("A");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], 1065);
     }
 }

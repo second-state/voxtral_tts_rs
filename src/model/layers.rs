@@ -156,11 +156,12 @@ impl RotaryEmbedding {
         #[cfg(feature = "mlx")]
         {
             // Use MLX fused RoPE kernel — single GPU dispatch
+            // traditional=true: split-half format (d, d+dim/2) matching Llama/Mistral convention
             let q_rot = Tensor::from_mlx(crate::backend::mlx::ops::fast_rope(
-                q.as_mlx(), self.dim as i32, false, Some(self.theta as f32), 1.0, 0,
+                q.as_mlx(), self.dim as i32, true, Some(self.theta as f32), 1.0, 0,
             ));
             let k_rot = Tensor::from_mlx(crate::backend::mlx::ops::fast_rope(
-                k.as_mlx(), self.dim as i32, false, Some(self.theta as f32), 1.0, 0,
+                k.as_mlx(), self.dim as i32, true, Some(self.theta as f32), 1.0, 0,
             ));
             (q_rot, k_rot)
         }
@@ -188,11 +189,12 @@ impl RotaryEmbedding {
         #[cfg(feature = "mlx")]
         {
             // Use MLX fused RoPE kernel with offset — single GPU dispatch
+            // traditional=true: split-half format (d, d+dim/2) matching Llama/Mistral convention
             let q_rot = Tensor::from_mlx(crate::backend::mlx::ops::fast_rope(
-                q.as_mlx(), self.dim as i32, false, Some(self.theta as f32), 1.0, pos as i32,
+                q.as_mlx(), self.dim as i32, true, Some(self.theta as f32), 1.0, pos as i32,
             ));
             let k_rot = Tensor::from_mlx(crate::backend::mlx::ops::fast_rope(
-                k.as_mlx(), self.dim as i32, false, Some(self.theta as f32), 1.0, pos as i32,
+                k.as_mlx(), self.dim as i32, true, Some(self.theta as f32), 1.0, pos as i32,
             ));
             (q_rot, k_rot)
         }
@@ -249,6 +251,9 @@ pub struct Attention {
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    q_norm: Option<RMSNorm>,
+    k_norm: Option<RMSNorm>,
+    sliding_window: Option<usize>,
 }
 
 impl Attention {
@@ -277,7 +282,21 @@ impl Attention {
             n_heads,
             n_kv_heads,
             head_dim,
+            q_norm: None,
+            k_norm: None,
+            sliding_window: None,
         }
+    }
+
+    /// Set optional QK norms (used by codec transformer layers).
+    pub fn set_qk_norms(&mut self, q_norm: RMSNorm, k_norm: RMSNorm) {
+        self.q_norm = Some(q_norm);
+        self.k_norm = Some(k_norm);
+    }
+
+    /// Set sliding window attention size (used by codec transformer layers).
+    pub fn set_sliding_window(&mut self, size: usize) {
+        self.sliding_window = Some(size);
     }
 
     /// Forward pass with optional KV cache for autoregressive decoding.
@@ -313,6 +332,17 @@ impl Attention {
         let q = self.wq.forward(x); // [B, S, n_heads * head_dim]
         let k = self.wk.forward(x); // [B, S, n_kv_heads * head_dim]
         let v = self.wv.forward(x); // [B, S, n_kv_heads * head_dim]
+
+        // Apply QK norm if present (used by codec transformer)
+        // Applied before reshape, on [B, S, dim] where dim = n_heads * head_dim
+        let q = match &self.q_norm {
+            Some(norm) => norm.forward(&q),
+            None => q,
+        };
+        let k = match &self.k_norm {
+            Some(norm) => norm.forward(&k),
+            None => k,
+        };
 
         // Reshape to multi-head format: [B, S, nH, D] -> [B, nH, S, D]
         let q = q
@@ -367,10 +397,27 @@ impl Attention {
                     // Cannot use ones().triu() * -inf because 0 * -inf = NaN in IEEE 754.
                     // Instead, use a large finite negative value.
                     let kv_seq_len = k.size()[2];
-                    let mask = Tensor::ones(&[seq_len as i64, kv_seq_len], DType::Float32, x.device())
+                    let mut mask = Tensor::ones(&[seq_len as i64, kv_seq_len], DType::Float32, x.device())
                         .triu(kv_seq_len - seq_len as i64 + 1)
                         * (-1e9);
+                    // Add sliding window mask: also mask positions > window_size in the past
+                    if let Some(window) = self.sliding_window {
+                        let window_mask = Tensor::ones(&[seq_len as i64, kv_seq_len], DType::Float32, x.device())
+                            .tril(-(window as i64))
+                            * (-1e9);
+                        mask = &mask + &window_mask;
+                    }
                     Some(mask.to_dtype(q.kind()))
+                } else if let Some(window) = self.sliding_window {
+                    // Sliding window without causal (bidirectional with limited range)
+                    let kv_seq_len = k.size()[2];
+                    let above = Tensor::ones(&[seq_len as i64, kv_seq_len], DType::Float32, x.device())
+                        .triu(window as i64)
+                        * (-1e9);
+                    let below = Tensor::ones(&[seq_len as i64, kv_seq_len], DType::Float32, x.device())
+                        .tril(-(window as i64))
+                        * (-1e9);
+                    Some((&above + &below).to_dtype(q.kind()))
                 } else {
                     None
                 };
@@ -397,8 +444,13 @@ impl Attention {
                 let scores = q.matmul(&k.transpose(-2, -1)) / scale;
 
                 let scores = if causal && seq_len > 1 {
-                    let mask = Tensor::ones(&[seq_len as i64, kv_seq_len], DType::Bool, x.device())
+                    let mut mask = Tensor::ones(&[seq_len as i64, kv_seq_len], DType::Bool, x.device())
                         .triu(kv_seq_len - seq_len as i64 + 1);
+                    if let Some(window) = self.sliding_window {
+                        let window_mask = Tensor::ones(&[seq_len as i64, kv_seq_len], DType::Bool, x.device())
+                            .tril(-(window as i64));
+                        mask = mask.logical_or(&window_mask);
+                    }
                     scores.masked_fill(&mask, f64::NEG_INFINITY)
                 } else {
                     scores
@@ -420,6 +472,95 @@ impl Attention {
         let output = self.wo.forward(&context);
 
         (output, new_k, new_v)
+    }
+
+    /// Forward pass without rotary positional embedding.
+    ///
+    /// Used by the flow-matching acoustic transformer which uses bidirectional
+    /// attention without any positional encoding.
+    pub fn forward_no_rope(
+        &self,
+        x: &Tensor,
+        causal: bool,
+    ) -> Tensor {
+        let shape = x.size(); // [B, S, D]
+        let batch = shape[0];
+        let seq_len = shape[1] as usize;
+
+        // Project Q, K, V
+        let q = self.wq.forward(x);
+        let k = self.wk.forward(x);
+        let v = self.wv.forward(x);
+
+        // Reshape to multi-head format: [B, S, nH, D] -> [B, nH, S, D]
+        let q = q
+            .reshape(&[batch, seq_len as i64, self.n_heads as i64, self.head_dim as i64])
+            .transpose(1, 2);
+        let k = k
+            .reshape(&[batch, seq_len as i64, self.n_kv_heads as i64, self.head_dim as i64])
+            .transpose(1, 2);
+        let v = v
+            .reshape(&[batch, seq_len as i64, self.n_kv_heads as i64, self.head_dim as i64])
+            .transpose(1, 2);
+
+        // NO RoPE applied — bidirectional attention without positional encoding
+
+        // Scaled dot-product attention
+        let context = {
+            #[cfg(feature = "mlx")]
+            {
+                let scale = 1.0 / (self.head_dim as f32).sqrt();
+                let mask = if causal && seq_len > 1 {
+                    let kv_seq_len = k.size()[2];
+                    let mask = Tensor::ones(&[seq_len as i64, kv_seq_len], DType::Float32, x.device())
+                        .triu(kv_seq_len - seq_len as i64 + 1)
+                        * (-1e9);
+                    Some(mask.to_dtype(q.kind()))
+                } else {
+                    None
+                };
+                Tensor::from_mlx(crate::backend::mlx::ops::fast_scaled_dot_product_attention(
+                    q.as_mlx(),
+                    k.as_mlx(),
+                    v.as_mlx(),
+                    scale,
+                    mask.as_ref().map(|m| m.as_mlx()),
+                ))
+            }
+            #[cfg(not(feature = "mlx"))]
+            {
+                let (k, v) = if self.n_kv_heads < self.n_heads {
+                    let n_rep = self.n_heads / self.n_kv_heads;
+                    (repeat_kv(&k, n_rep), repeat_kv(&v, n_rep))
+                } else {
+                    (k, v)
+                };
+
+                let scale = (self.head_dim as f64).sqrt();
+                let scores = q.matmul(&k.transpose(-2, -1)) / scale;
+
+                let scores = if causal && seq_len > 1 {
+                    let kv_seq_len = k.size()[2];
+                    let mask = Tensor::ones(&[seq_len as i64, kv_seq_len], DType::Bool, x.device())
+                        .triu(kv_seq_len - seq_len as i64 + 1);
+                    scores.masked_fill(&mask, f64::NEG_INFINITY)
+                } else {
+                    scores
+                };
+
+                let attn = scores.softmax(-1);
+                attn.matmul(&v)
+            }
+        };
+
+        // Reshape back: [B, nH, S, D] -> [B, S, nH*D]
+        let context = context.transpose(1, 2).contiguous().reshape(&[
+            batch,
+            seq_len as i64,
+            (self.n_heads * self.head_dim) as i64,
+        ]);
+
+        self.wo.forward(&context)
     }
 }
 
@@ -491,10 +632,10 @@ impl MLP {
 /// x -> RMSNorm -> Attention -> + (residual) -> RMSNorm -> MLP -> + (residual)
 /// ```
 pub struct TransformerLayer {
-    attention_norm: RMSNorm,
-    attention: Attention,
-    ffn_norm: RMSNorm,
-    feed_forward: MLP,
+    pub(crate) attention_norm: RMSNorm,
+    pub(crate) attention: Attention,
+    pub(crate) ffn_norm: RMSNorm,
+    pub(crate) feed_forward: MLP,
 }
 
 impl TransformerLayer {
@@ -567,6 +708,22 @@ impl TransformerLayer {
         let out = &h + &ffn_out;
 
         (out, new_k, new_v)
+    }
+
+    /// Forward pass without rotary positional embedding.
+    ///
+    /// Used by the flow-matching acoustic transformer which uses bidirectional
+    /// attention without any positional encoding (no RoPE, no KV cache).
+    pub fn forward_no_rope(&self, x: &Tensor, causal: bool) -> Tensor {
+        // Pre-norm attention with residual (no RoPE)
+        let normed = self.attention_norm.forward(x);
+        let attn_out = self.attention.forward_no_rope(&normed, causal);
+        let h = x + &attn_out;
+
+        // Pre-norm FFN with residual
+        let normed = self.ffn_norm.forward(&h);
+        let ffn_out = self.feed_forward.forward(&normed);
+        &h + &ffn_out
     }
 }
 

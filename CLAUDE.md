@@ -104,7 +104,19 @@ MLX builds a computation graph lazily. The graph must be evaluated periodically 
 **Symptom of too few eval():** Graph grows across iterations, causing exponential slowdowns.
 **Symptom of too many eval():** Each eval() has fixed overhead for graph traversal, scheduling, and GPU synchronization. Reducing from ~130 to ~8 eval() calls per frame improved flow matching from 0.53s to 0.28s per frame.
 
-### 2. KV Cache Must Replace, Not Concatenate
+### 2. RoPE Must Use Split-Half (traditional=true)
+
+MLX `fast_rope` has a `traditional` parameter controlling how dimension pairs are formed:
+- `traditional=true` (split-half): pairs dimension `d` with `d + dim/2` — **correct for Llama/Mistral**
+- `traditional=false` (interleaved): pairs `2d` with `2d+1`
+
+Llama/Mistral models require split-half format. Using interleaved format corrupts all attention computations, causing the backbone hidden states to be completely wrong.
+
+**Symptom:** Backbone hidden states have wrong norms, semantic code is always the same value (e.g., 10), END_AUDIO is never predicted. All weights are correct but outputs diverge at Layer 0.
+
+**Discovery method:** Compare layer-by-layer outputs against mlx-audio reference implementation. The divergence appears immediately at Layer 0 attention output when RoPE is wrong.
+
+### 3. KV Cache Must Replace, Not Concatenate
 
 The attention layer already concatenates old cache + new K/V internally before returning. The KV cache `update()` method must **replace** the stored tensors, not concatenate again:
 
@@ -121,7 +133,7 @@ pub fn update(&mut self, layer_idx: usize, new_k: Tensor, new_v: Tensor) {
 
 **Symptom:** Matmul shape errors with large unexpected dimensions (e.g., 113664 instead of 222).
 
-### 3. PyTorch vs MLX Tensor Format
+### 4. PyTorch vs MLX Tensor Format
 
 | Operation | PyTorch | MLX |
 |-----------|---------|-----|
@@ -131,26 +143,51 @@ pub fn update(&mut self, layer_idx: usize, new_k: Tensor, new_v: Tensor) {
 
 The `tensor.rs` conv methods handle these transposes automatically. The weights from safetensors are in PyTorch format and get transposed before calling MLX ops.
 
-### 4. MLX Initialization
+### 5. MLX Initialization
 
 `Device::best_available()` must call `init_mlx(true)` before any MLX operations. Without this, all MLX calls panic with "MLX not initialized".
+
+## Special Token IDs
+
+| Token | ID | Usage |
+|-------|----|-------|
+| BOS | 1 | Start of sequence |
+| AUDIO | 24 | Fed after prefill to trigger first frame generation |
+| BEGIN_AUDIO | 25 | Marks start of audio region (before voice embs, before generation) |
+| REPEAT_AUDIO_TEXT | 35 | Marks end of text, before second BEGIN_AUDIO |
+| NEXT_AUDIO_TEXT | 36 | Marks end of voice embs, before text tokens |
+| EMPTY_AUDIO | 0 | Semantic code: never valid (masked to -1e9) |
+| END_AUDIO | 1 | Semantic code: signals end of generation |
+
+## Reference Implementation
+
+The authoritative Python reference is **mlx-audio** (`mlx_audio.tts`), specifically:
+- `mlx_audio/tts/voxtral_tts/voxtral_tts.py` — model class, `generate()`, `_encode_text()`, `_build_input_embeddings()`
+- `mlx_audio/tts/voxtral_tts/acoustic_head.py` — flow matching transformer, Euler ODE, CFG
+
+Install from git main (PyPI may lag): `pip3 install git+https://github.com/Blaizzy/mlx-audio.git@main`
 
 ## Inference Pipeline Details
 
 ### Prefill Sequence Construction
 
 ```
-[text_token_0, text_token_1, ..., begin_audio_token, voice_emb_0, voice_emb_1, ..., voice_emb_N]
+[BOS(1)] [BEGIN_AUDIO(25)] [voice_emb_0, ..., voice_emb_N] [NEXT_AUDIO_TEXT(36)] [text_tok_0, ..., text_tok_M] [REPEAT_AUDIO_TEXT(35)] [BEGIN_AUDIO(25)]
 ```
 
-- Text tokens: looked up in `tok_embeddings` [131072, 3072]
-- Begin-audio token (ID 25): looked up in `tok_embeddings`
-- Voice embeddings: pre-computed backbone hidden states [N, 3072], injected directly
+- BOS, BEGIN_AUDIO, NEXT_AUDIO_TEXT, REPEAT_AUDIO_TEXT, final BEGIN_AUDIO: looked up in `tok_embeddings` [131072, 3072]
+- Voice embeddings: pre-computed backbone hidden states [N, 3072], injected directly (not via embedding table)
+- Text tokens: looked up in `tok_embeddings`
+
+After prefill, the AUDIO token (ID 24) is fed as the first decode step to produce the initial hidden state for frame generation.
 
 ### Per-Frame Audio Code Generation
 
-1. **Semantic code**: `semantic_codebook_output.forward(hidden_state)` -> argmax over [8320] logits
-   - Codes 0-1 are special (EOS, padding), valid range is [2, 8194)
+1. **Semantic code**: Cast hidden state to F32, then `semantic_codebook_output.forward(hidden_state_f32)` -> argmax over [8320] logits
+   - Code 0 = EMPTY_AUDIO (masked to -1e9, never predicted)
+   - Code 1 = END_AUDIO (left unmasked; signals stop when predicted)
+   - Valid semantic codes: [2, 8194), codes >= 8194 masked to -1e9
+   - F32 precision is required for the matmul (matches mlx-audio reference)
 2. **36 acoustic codes**: Euler ODE flow matching
    - Initialize `x_0 ~ N(0, 1)` with shape [1, 36]
    - 7 Euler steps from t=0 to t=1
@@ -164,7 +201,7 @@ The backbone has a single [9088, 3072] codebook embedding table for 37 codebooks
 - Codebook 0 (semantic): 8192 + 2 special = 8194 entries, offset 0
 - Codebooks 1-36 (acoustic): 21 + 2 special = 23 entries each
 
-Each frame's 37 embeddings are summed together with the text embedding for `audio_token_id` (24).
+Each frame's 37 codebook embeddings are summed together to produce a single [dim] vector. This is fed directly into the backbone for the next step — the AUDIO token (ID 24) embedding is **not** added per-frame (it is only used once as the initial decode step after prefill).
 
 ### Codec Decoder
 
@@ -192,24 +229,29 @@ Voice embeddings are pre-computed backbone hidden states. Each voice is a tensor
 
 The original checkpoint stores these as PyTorch `.pt` files. For the MLX backend, they must be converted to `.safetensors` format (key: `embedding`).
 
-## Codec QK Norm and Layer Scale
+## Codec Transformer Layer (Critical for Audio Quality)
 
-The codec transformer layers have two features not present in the backbone:
+The codec transformer layers have three features not present in the backbone. All are **required** for correct audio output — without them, decoder values explode and produce static noise:
 
-1. **QK Norm**: RMSNorm applied separately to Q and K projections before attention (weights: `q_norm.weight`, `k_norm.weight`). Currently loaded but not applied (the standard attention path is used).
+1. **QK Norm**: RMSNorm applied to Q and K projections *before* multi-head reshape (weight shape [1024] matches full projected dim, not per-head). Uses `qk_norm_eps` = 1e-6.
 
-2. **Layer Scale**: Learnable per-channel scales applied after attention and FFN outputs (`attention_scale`, `ffn_scale`). Currently loaded but approximated (scales are close to 1.0 after training).
+2. **Layer Scale**: Per-channel learnable scales applied to attention and FFN outputs *before* the residual add: `x + scale * attn_out`. Without this, values explode through decoder blocks (89→46→260→700 max_abs).
 
-Both are areas for improvement if audio quality needs to be refined.
+3. **norm_eps = 0.01**: The codec uses a much larger norm_eps (0.01) for attention_norm/ffn_norm than the backbone (1e-5). This is separate from qk_norm_eps (1e-6).
+
+4. **Causal attention**: The codec uses causal (not bidirectional) attention.
+
+5. **Sliding window**: `attn_sliding_window_size: 16` — implemented in the attention layer for the codec transformer.
 
 ## Performance Notes
 
 On Apple M4 Max (MLX backend):
 - Model loading: ~0.1s (memory-mapped safetensors)
-- Prefill (221 tokens, 26 layers): ~3.3s
+- Prefill (225 tokens, 26 layers): ~3.3s
 - Per-frame generation: ~0.34s (backbone ~70ms + flow matching ~270ms)
-- Codec decoding: ~0.2s
-- Total for "Hello." (110 frames): ~41s (~2.9 frames/s, RTF ~4.7)
+- Codec decoding: ~0.16s
+- "Hello." (19 frames, 1.52s audio): ~10.5s total
+- "The quick brown fox jumps over the lazy dog." (41 frames, 3.28s audio): ~17s total
 
 ### Optimizations Applied (2.5x total speedup)
 
@@ -228,6 +270,14 @@ On Apple M4 Max (MLX backend):
 ### Remaining Bottleneck
 
 Flow matching is 80% of per-frame time (270ms vs 70ms backbone). Each frame requires 7 Euler steps × 3 transformer layers (batch=2, seq=3). The small matrix sizes [6, 3072] cannot saturate the GPU efficiently. The backbone is relatively efficient at ~2.6ms/layer for single-token decode with KV cache.
+
+## Tekken Tokenizer
+
+The Voxtral checkpoint uses a Tekken BPE tokenizer (`tekken.json`). Key details:
+
+- **Special token offset**: BPE token IDs are offset by `num_special_tokens` (1000). Special/control tokens occupy IDs 0–999, BPE tokens start at 1000. The tokenizer must add this offset when encoding.
+- **Format**: `tekken.json` can be either `{ "config": ..., "vocab": [...] }` (v7) or a bare array `[...]` (legacy). The code handles both.
+- **Vocab cap**: The tokenizer caps output IDs to `vocab_size` (131072) to prevent OOB on `tok_embeddings`.
 
 ## Audio Encoding (Multi-Format Output)
 

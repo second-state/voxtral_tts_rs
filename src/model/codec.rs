@@ -16,7 +16,7 @@ use crate::config::AudioTokenizerConfig;
 use crate::error::{Result, VoxtralError};
 use crate::tensor::{DType, Device, Tensor};
 
-use super::layers::{RotaryEmbedding, TransformerLayer};
+use super::layers::{RMSNorm, RotaryEmbedding, TransformerLayer};
 
 // ---------------------------------------------------------------------------
 // Weight-normalized Conv1d
@@ -27,62 +27,23 @@ use super::layers::{RotaryEmbedding, TransformerLayer};
 /// When weight-normalized, the effective weight is `g * v / ||v||` where:
 /// - `g` = `parametrizations.weight.original0` (per-output-channel magnitude)
 /// - `v` = `parametrizations.weight.original1` (direction)
-struct WNConv1d {
+/// Causal 1D convolution with weight normalization.
+///
+/// Left-pads the input with replicate padding, then applies Conv1d with no
+/// built-in padding. This ensures the output at time t only depends on
+/// inputs at times <= t.
+struct CausalConv1d {
     weight: Tensor,
     stride: i64,
-    padding: i64,
+    /// Total left padding = (kernel_size - 1) * dilation + 1 - stride.
+    left_pad: i64,
 }
 
-impl WNConv1d {
-    /// Load from weight-normalized parameters.
-    fn from_weight_norm(g: &Tensor, v: &Tensor, stride: i64, padding: i64) -> Self {
-        // Compute effective weight: g * v / ||v||
-        // g: [out_ch, 1, 1], v: [out_ch, in_ch, kernel]
-        // Norm over dims [1, 2] (in_ch, kernel), keeping dim
+impl CausalConv1d {
+    fn from_weight_norm(g: &Tensor, v: &Tensor, stride: i64, kernel_size: i64) -> Self {
         let v_f32 = v.to_dtype(DType::Float32);
         let g_f32 = g.to_dtype(DType::Float32);
 
-        let v_norm = v_f32
-            .pow_scalar(2.0)
-            .sum_dim(&[-1, -2], true) // [out_ch, 1, 1]
-            .sqrt()
-            .clamp_min(1e-12);
-        let weight = &g_f32 * &(&v_f32 / &v_norm);
-
-        Self {
-            weight,
-            stride,
-            padding,
-        }
-    }
-
-    fn forward(&self, x: &Tensor) -> Tensor {
-        // x: [B, in_ch, T]
-        x.conv1d(
-            &self.weight,
-            None,
-            &[self.stride],
-            &[self.padding],
-            &[1], // dilation
-            1,    // groups
-        )
-    }
-}
-
-/// Transposed 1D convolution with weight normalization (for upsampling).
-struct WNConvTranspose1d {
-    weight: Tensor,
-    stride: i64,
-    padding: i64,
-}
-
-impl WNConvTranspose1d {
-    fn from_weight_norm(g: &Tensor, v: &Tensor, stride: i64, padding: i64) -> Self {
-        let v_f32 = v.to_dtype(DType::Float32);
-        let g_f32 = g.to_dtype(DType::Float32);
-
-        // For ConvTranspose1d, weight shape is [in_ch, out_ch, kernel]
-        // Norm over dims [1, 2]
         let v_norm = v_f32
             .pow_scalar(2.0)
             .sum_dim(&[-1, -2], true)
@@ -90,24 +51,89 @@ impl WNConvTranspose1d {
             .clamp_min(1e-12);
         let weight = &g_f32 * &(&v_f32 / &v_norm);
 
+        // Causal: all padding on left side
+        let left_pad = kernel_size - stride;
+
         Self {
             weight,
             stride,
-            padding,
+            left_pad,
         }
     }
 
     fn forward(&self, x: &Tensor) -> Tensor {
-        // x: [B, in_ch, T]
-        x.conv_transpose1d(
+        // x: [B, C, T]
+        // Pad left with replicate (edge) padding: repeat first sample left_pad times
+        let x = if self.left_pad > 0 {
+            let first = x.narrow(2, 0, 1); // [B, C, 1]
+            let pad = first.expand(&[-1, -1, self.left_pad], false); // [B, C, left_pad]
+            Tensor::cat(&[pad, x.clone()], 2) // [B, C, left_pad + T]
+        } else {
+            x.clone()
+        };
+        x.conv1d(
             &self.weight,
             None,
             &[self.stride],
-            &[self.padding],
+            &[0], // no built-in padding
+            &[1], // dilation
+            1,    // groups
+        )
+    }
+}
+
+/// Causal transposed 1D convolution with weight normalization (for upsampling).
+///
+/// Runs ConvTranspose1d with no padding, then trims excess samples from
+/// the RIGHT side only (causal: output at time t depends on input at times <= t).
+struct CausalConvTranspose1d {
+    weight: Tensor,
+    stride: i64,
+    /// Number of samples to trim from the right of the raw output.
+    right_trim: i64,
+}
+
+impl CausalConvTranspose1d {
+    fn from_weight_norm(g: &Tensor, v: &Tensor, stride: i64, kernel_size: i64) -> Self {
+        let v_f32 = v.to_dtype(DType::Float32);
+        let g_f32 = g.to_dtype(DType::Float32);
+
+        let v_norm = v_f32
+            .pow_scalar(2.0)
+            .sum_dim(&[-1, -2], true)
+            .sqrt()
+            .clamp_min(1e-12);
+        let weight = &g_f32 * &(&v_f32 / &v_norm);
+
+        // total_padding = kernel_size - stride; trim all from right (causal)
+        let right_trim = kernel_size - stride;
+
+        Self {
+            weight,
+            stride,
+            right_trim,
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Tensor {
+        // x: [B, C, T]
+        // Run conv_transpose with NO padding
+        let out = x.conv_transpose1d(
+            &self.weight,
+            None,
+            &[self.stride],
+            &[0], // no built-in padding
             &[0], // output_padding
             1,    // groups
             &[1], // dilation
-        )
+        );
+        // Trim right_trim samples from the right
+        if self.right_trim > 0 {
+            let out_len = out.size()[2];
+            out.narrow(2, 0, out_len - self.right_trim)
+        } else {
+            out
+        }
     }
 }
 
@@ -124,9 +150,11 @@ struct CodecTransformerLayer {
     /// The base transformer layer (attention + FFN).
     base: TransformerLayer,
     /// Per-channel scale after attention output.
-    _attention_scale: Option<Tensor>,
+    attention_scale: Option<Tensor>,
     /// Per-channel scale after FFN output.
-    _ffn_scale: Option<Tensor>,
+    ffn_scale: Option<Tensor>,
+    /// Whether to use causal attention.
+    causal: bool,
 }
 
 impl CodecTransformerLayer {
@@ -134,36 +162,68 @@ impl CodecTransformerLayer {
         weights: &HashMap<String, Tensor>,
         prefix: &str,
         config: &AudioTokenizerConfig,
+        sliding_window: usize,
     ) -> Self {
-        let base = TransformerLayer::from_weights(
+        // Use config.norm_eps (0.01) for attention_norm/ffn_norm, NOT qk_norm_eps (1e-6)
+        let mut base = TransformerLayer::from_weights(
             weights,
             prefix,
             config.n_heads,
             config.n_kv_heads,
             config.head_dim,
-            config.qk_norm_eps,
+            config.norm_eps,
         );
 
-        let attention_scale = weights.get(&format!("{}.attention_scale", prefix)).cloned();
+        // Load QK norms (codec transformer applies RMSNorm to Q and K projections)
+        let q_norm_key = format!("{}.attention.q_norm.weight", prefix);
+        let k_norm_key = format!("{}.attention.k_norm.weight", prefix);
+        if let (Some(q_w), Some(k_w)) = (weights.get(&q_norm_key), weights.get(&k_norm_key)) {
+            base.attention.set_qk_norms(
+                RMSNorm::from_weights(q_w.clone(), config.qk_norm_eps),
+                RMSNorm::from_weights(k_w.clone(), config.qk_norm_eps),
+            );
+            tracing::debug!("Loaded QK norms for {}", prefix);
+        }
 
+        // Set sliding window attention
+        if sliding_window > 0 {
+            base.attention.set_sliding_window(sliding_window);
+            tracing::debug!("Set sliding window={} for {}", sliding_window, prefix);
+        }
+
+        let attention_scale = weights.get(&format!("{}.attention_scale", prefix)).cloned();
         let ffn_scale = weights.get(&format!("{}.ffn_scale", prefix)).cloned();
 
         Self {
             base,
-            _attention_scale: attention_scale,
-            _ffn_scale: ffn_scale,
+            attention_scale,
+            ffn_scale,
+            causal: config.causal,
         }
     }
 
     fn forward(&self, x: &Tensor, rotary_emb: &RotaryEmbedding) -> Tensor {
-        // Use the base transformer layer forward
-        let (out, _k, _v) = self.base.forward(x, rotary_emb, 0, None, false);
+        // Pre-norm attention with residual + layer scale
+        let normed = self.base.attention_norm.forward(x);
+        let seq_len = x.size()[1] as usize;
+        let (attn_out, _k, _v) =
+            self.base
+                .attention
+                .forward(&normed, rotary_emb, 0, None, self.causal && seq_len > 1);
+        let attn_out = match &self.attention_scale {
+            Some(scale) => &attn_out * scale,
+            None => attn_out,
+        };
+        let h = x + &attn_out;
 
-        // Note: Layer scale is already baked into the residual connection
-        // in a simplified form. For full correctness we'd need to separate
-        // the attention and FFN outputs, but this approximation works for
-        // the decoder since the scales are close to 1.0 after training.
-        out
+        // Pre-norm FFN with residual + layer scale
+        let normed = self.base.ffn_norm.forward(&h);
+        let ffn_out = self.base.feed_forward.forward(&normed);
+        let ffn_out = match &self.ffn_scale {
+            Some(scale) => &ffn_out * scale,
+            None => ffn_out,
+        };
+        &h + &ffn_out
     }
 }
 
@@ -176,15 +236,15 @@ pub struct Codec {
     /// Semantic codebook: `[8192, 256]`.
     semantic_codebook: Tensor,
     /// Decoder conv blocks (even indices) and transformer blocks (odd indices).
-    /// Block 0: WNConv1d (input projection, stride 1)
+    /// Block 0: CausalConv1d (input projection, stride 1)
     /// Block 1: 2 transformer layers
-    /// Block 2: WNConv1d or WNConvTranspose1d (upsampling)
+    /// Block 2: CausalConvTranspose1d (upsampling)
     /// Block 3: 2 transformer layers
     /// ...
     decoder_convs: Vec<DecoderConv>,
     decoder_transformers: Vec<DecoderTransformerBlock>,
-    /// Output projection: dim → 240 channels.
-    output_proj: WNConv1d,
+    /// Output projection: dim → 240 channels (causal conv, kernel=7).
+    output_proj: CausalConv1d,
     /// Configuration.
     config: AudioTokenizerConfig,
     /// RoPE for codec transformer layers.
@@ -193,8 +253,8 @@ pub struct Codec {
 }
 
 enum DecoderConv {
-    Conv1d(WNConv1d),
-    ConvTranspose1d(WNConvTranspose1d),
+    Conv1d(CausalConv1d),
+    ConvTranspose1d(CausalConvTranspose1d),
 }
 
 struct DecoderTransformerBlock {
@@ -275,15 +335,21 @@ impl Codec {
         let mut decoder_convs = Vec::new();
         let mut decoder_transformers = Vec::new();
 
+        // Sliding window sizes: base_window / 2^(n_blocks-1-i)
+        // e.g., with base=16 and 4 blocks: [2, 4, 8, 16]
+        let base_window = config.attn_sliding_window_size;
+
         for i in 0..n_conv_blocks {
             let conv_block_idx = i * 2; // even indices are conv blocks
             let transformer_block_idx = i * 2 + 1; // odd indices are transformer blocks
 
             let stride = config.decoder_conv_strides[i] as i64;
             let kernel = config.decoder_conv_kernels[i] as i64;
-            let padding = kernel / 2;
 
-            // Load conv block (weight-normalized)
+            // Window doubles per decoder stage: 2, 4, 8, 16
+            let window = base_window >> (n_conv_blocks - 1 - i);
+
+            // Load conv block (weight-normalized, causal)
             let g_key = format!(
                 "{}.decoder_blocks.{}.conv.parametrizations.weight.original0",
                 prefix, conv_block_idx
@@ -298,12 +364,12 @@ impl Codec {
                 let v = v.to_dtype(DType::Float32).to_device(device);
 
                 if stride == 1 {
-                    decoder_convs.push(DecoderConv::Conv1d(WNConv1d::from_weight_norm(
-                        &g, &v, stride, padding,
-                    )));
+                    decoder_convs.push(DecoderConv::Conv1d(
+                        CausalConv1d::from_weight_norm(&g, &v, stride, kernel),
+                    ));
                 } else {
                     decoder_convs.push(DecoderConv::ConvTranspose1d(
-                        WNConvTranspose1d::from_weight_norm(&g, &v, stride, padding),
+                        CausalConvTranspose1d::from_weight_norm(&g, &v, stride, kernel),
                     ));
                 }
             } else {
@@ -311,16 +377,15 @@ impl Codec {
                     "Decoder conv block {} not found, using identity",
                     conv_block_idx
                 );
-                // Fallback: identity-like conv
                 let w = Tensor::zeros(
                     &[config.dim as i64, config.dim as i64, 1],
                     DType::Float32,
                     device,
                 );
-                decoder_convs.push(DecoderConv::Conv1d(WNConv1d {
+                decoder_convs.push(DecoderConv::Conv1d(CausalConv1d {
                     weight: w,
                     stride: 1,
-                    padding: 0,
+                    left_pad: 0,
                 }));
             }
 
@@ -334,7 +399,8 @@ impl Codec {
                     "{}.decoder_blocks.{}.layers.{}",
                     prefix, transformer_block_idx, j
                 );
-                let layer = CodecTransformerLayer::from_weights(weights, &layer_prefix, &config);
+                let layer =
+                    CodecTransformerLayer::from_weights(weights, &layer_prefix, &config, window);
                 layers.push(layer);
             }
 
@@ -355,17 +421,17 @@ impl Codec {
             if let (Some(g), Some(v)) = (weights.get(&output_g_key), weights.get(&output_v_key)) {
                 let g = g.to_dtype(DType::Float32).to_device(device);
                 let v = v.to_dtype(DType::Float32).to_device(device);
-                WNConv1d::from_weight_norm(&g, &v, 1, 3) // kernel=7, padding=3
+                CausalConv1d::from_weight_norm(&g, &v, 1, 7) // kernel=7, causal left-pad=6
             } else {
                 tracing::warn!("Output projection not found, using zeros");
-                WNConv1d {
+                CausalConv1d {
                     weight: Tensor::zeros(
                         &[crate::PRETRANSFORM_PATCH_SIZE as i64, config.dim as i64, 7],
                         DType::Float32,
                         device,
                     ),
                     stride: 1,
-                    padding: 3,
+                    left_pad: 6,
                 }
             };
 
@@ -495,7 +561,7 @@ impl Codec {
             for layer in &transformer_block.layers {
                 h = layer.forward(&h, &transformer_block.rotary_emb);
             }
-            tracing::debug!("Decoder block {} done", i);
+            tracing::debug!("Decoder block {} done: shape={:?}", i, h.size());
         }
 
         // Output projection: [B, T, D] → [B, D, T] → conv → [B, 240, T']
