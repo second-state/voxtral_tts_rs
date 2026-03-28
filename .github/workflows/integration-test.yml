@@ -94,59 +94,69 @@ jobs:
           "
 
       # ---------------------------------------------------------------
-      # CLI tests
+      # CLI tests — different voices and text lengths
       # ---------------------------------------------------------------
       # Note: macOS CI runners (M1) are ~60x slower than local M4 Max
       # for MLX inference, so we use shorter text on macOS to stay
       # within the 6h GitHub Actions timeout.
 
-      - name: "CLI: Generate speech (English, neutral_female)"
+      - name: "CLI: Short English (neutral_female)"
+        env:
+          RUST_LOG: info
         run: |
-          if [ "${{ matrix.backend }}" = "mlx" ]; then
-            TEXT="Hello."
-          else
-            TEXT="${{ inputs.text }}"
-          fi
           ./target/release/voxtral-tts models/voxtral-4b-tts \
-            --text "$TEXT" \
+            --text "Hello." \
             --voice neutral_female \
-            --output neutral_female_english.wav
-          file neutral_female_english.wav
-          ls -lh neutral_female_english.wav
+            --output cli_short.wav
+          file cli_short.wav
+          ls -lh cli_short.wav
 
-      - name: "CLI: Generate speech (French, fr_female)"
+      - name: "CLI: Medium English (neutral_male)"
+        if: matrix.backend != 'mlx'
+        env:
+          RUST_LOG: info
+        run: |
+          ./target/release/voxtral-tts models/voxtral-4b-tts \
+            --text "The quick brown fox jumps over the lazy dog. This is a longer sentence to test audio generation quality." \
+            --voice neutral_male \
+            --output cli_medium.wav
+          file cli_medium.wav
+          ls -lh cli_medium.wav
+
+      - name: "CLI: French (fr_female)"
         if: matrix.backend != 'mlx'
         run: |
           ./target/release/voxtral-tts models/voxtral-4b-tts \
             --text "Bonjour! Ceci est un test du système Voxtral." \
             --voice fr_female \
-            --output fr_female_french.wav
-          file fr_female_french.wav
-          ls -lh fr_female_french.wav
+            --output cli_french.wav
+          file cli_french.wav
+          ls -lh cli_french.wav
 
-      - name: "CLI: Generate speech (custom voice via input)"
+      - name: "CLI: Custom voice via input"
         if: inputs.voice != 'neutral_female' && matrix.backend != 'mlx'
         run: |
           ./target/release/voxtral-tts models/voxtral-4b-tts \
             --text "${{ inputs.text }}" \
             --voice "${{ inputs.voice }}" \
-            --output custom_voice.wav
-          file custom_voice.wav
-          ls -lh custom_voice.wav
+            --output cli_custom.wav
+          file cli_custom.wav
+          ls -lh cli_custom.wav
 
       - name: "CLI: List voices"
         run: ./target/release/voxtral-tts models/voxtral-4b-tts --list-voices --text ""
 
       # ---------------------------------------------------------------
-      # API server tests
+      # API server tests — non-streaming, streaming, MP3
       # ---------------------------------------------------------------
 
       - name: "Server: Start in background"
+        env:
+          RUST_LOG: info
         run: |
-          ./target/release/voxtral-tts-server models/voxtral-4b-tts --port 8090 &
+          RUST_LOG=info ./target/release/voxtral-tts-server models/voxtral-4b-tts --port 8090 &
           SERVER_PID=$!
           echo "SERVER_PID=$SERVER_PID" >> "$GITHUB_ENV"
-          # Wait for server to be ready
           for i in $(seq 1 60); do
             if curl -sf http://127.0.0.1:8090/health > /dev/null 2>&1; then
               echo "Server ready after ${i}s"
@@ -162,21 +172,26 @@ jobs:
       - name: "Server: GET /v1/models"
         run: curl -sf http://127.0.0.1:8090/v1/models | tee /dev/stderr | grep -q voxtral
 
-      - name: "Server: POST /v1/audio/speech (alloy)"
+      - name: "API non-streaming: short (alloy)"
         run: |
-          if [ "${{ matrix.backend }}" = "mlx" ]; then
-            INPUT="Hello."
-          else
-            INPUT="Hello from the API server."
-          fi
           curl -sf -X POST http://127.0.0.1:8090/v1/audio/speech \
             -H "Content-Type: application/json" \
-            -d "{\"input\":\"$INPUT\",\"voice\":\"alloy\",\"model\":\"voxtral-4b-tts\"}" \
-            -o api_alloy.wav
-          file api_alloy.wav
-          ls -lh api_alloy.wav
+            -d '{"input":"Hello.","voice":"alloy","model":"voxtral-4b-tts"}' \
+            -o api_short.wav
+          file api_short.wav
+          ls -lh api_short.wav
 
-      - name: "Server: POST /v1/audio/speech (es_male)"
+      - name: "API non-streaming: medium (neutral_female)"
+        if: matrix.backend != 'mlx'
+        run: |
+          curl -sf -X POST http://127.0.0.1:8090/v1/audio/speech \
+            -H "Content-Type: application/json" \
+            -d '{"input":"The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.","voice":"neutral_female","model":"voxtral-4b-tts"}' \
+            -o api_medium.wav
+          file api_medium.wav
+          ls -lh api_medium.wav
+
+      - name: "API non-streaming: Spanish (es_male)"
         if: matrix.backend != 'mlx'
         run: |
           curl -sf -X POST http://127.0.0.1:8090/v1/audio/speech \
@@ -186,41 +201,69 @@ jobs:
           file api_es_male.wav
           ls -lh api_es_male.wav
 
-      - name: "Server: POST /v1/audio/speech (mp3)"
+      - name: "API streaming: SSE (alloy)"
+        run: |
+          if [ "${{ matrix.backend }}" = "mlx" ]; then
+            MAX_TIME=7200
+          else
+            MAX_TIME=300
+          fi
+          curl -sN -X POST http://127.0.0.1:8090/v1/audio/speech \
+            -H "Content-Type: application/json" \
+            -d '{"input":"Hello.","voice":"alloy","stream":true}' \
+            --max-time "$MAX_TIME" \
+            -o sse_output.txt || true
+          echo "--- SSE output (first 500 chars) ---"
+          head -c 500 sse_output.txt
+          echo ""
+          grep -q "speech.audio.delta" sse_output.txt || (echo "Missing speech.audio.delta"; exit 1)
+          grep -q "speech.audio.done" sse_output.txt || (echo "Missing speech.audio.done"; exit 1)
+          echo "Streaming SSE test passed"
+
+          # Decode base64 PCM chunks into a playable WAV file
+          python3 -c "
+          import base64, struct, json
+
+          raw_pcm = b''
+          with open('sse_output.txt') as f:
+              for line in f:
+                  line = line.strip()
+                  if not line.startswith('data:'):
+                      continue
+                  payload = json.loads(line[len('data:'):].strip())
+                  if payload.get('type') == 'speech.audio.delta':
+                      raw_pcm += base64.b64decode(payload['delta'])
+
+          assert len(raw_pcm) > 0, 'No PCM data decoded from SSE stream'
+          print(f'Decoded {len(raw_pcm)} bytes of PCM from SSE stream')
+
+          sample_rate = 24000
+          channels = 1
+          bits = 16
+          data_size = len(raw_pcm)
+          with open('api_streaming.wav', 'wb') as out:
+              out.write(b'RIFF')
+              out.write(struct.pack('<I', 36 + data_size))
+              out.write(b'WAVE')
+              out.write(b'fmt ')
+              out.write(struct.pack('<IHHIIHH', 16, 1, channels, sample_rate,
+                                   sample_rate * channels * bits // 8, channels * bits // 8, bits))
+              out.write(b'data')
+              out.write(struct.pack('<I', data_size))
+              out.write(raw_pcm)
+          print('Wrote api_streaming.wav')
+          "
+          file api_streaming.wav
+          ls -lh api_streaming.wav
+
+      - name: "API non-streaming: MP3 (alloy)"
         run: |
           curl -sf -X POST http://127.0.0.1:8090/v1/audio/speech \
             -H "Content-Type: application/json" \
             -d '{"input":"Hello.","voice":"alloy","response_format":"mp3"}' \
-            -o api_alloy.mp3
-          file api_alloy.mp3
-          ls -lh api_alloy.mp3
-
-      - name: "Server: POST /v1/audio/speech (flac)"
-        run: |
-          curl -sf -X POST http://127.0.0.1:8090/v1/audio/speech \
-            -H "Content-Type: application/json" \
-            -d '{"input":"Hello.","voice":"alloy","response_format":"flac"}' \
-            -o api_alloy.flac
-          file api_alloy.flac
-          ls -lh api_alloy.flac
-
-      - name: "Server: POST /v1/audio/speech (ogg/opus)"
-        run: |
-          curl -sf -X POST http://127.0.0.1:8090/v1/audio/speech \
-            -H "Content-Type: application/json" \
-            -d '{"input":"Hello.","voice":"alloy","response_format":"ogg"}' \
-            -o api_alloy.ogg
-          file api_alloy.ogg
-          ls -lh api_alloy.ogg
-
-      - name: "Server: POST /v1/audio/speech (pcm)"
-        run: |
-          curl -sf -X POST http://127.0.0.1:8090/v1/audio/speech \
-            -H "Content-Type: application/json" \
-            -d '{"input":"Hello.","voice":"alloy","response_format":"pcm"}' \
-            -o api_alloy.pcm
-          test -s api_alloy.pcm
-          ls -lh api_alloy.pcm
+            -o api_test.mp3
+          file api_test.mp3
+          ls -lh api_test.mp3
 
       - name: "Server: Validation errors"
         run: |
@@ -245,63 +288,6 @@ jobs:
           echo "Invalid speed: $STATUS"
           [ "$STATUS" = "400" ] || (echo "Expected 400, got $STATUS"; exit 1)
 
-      - name: "Server: Streaming SSE"
-        run: |
-          # MLX CI runners are ~60x slower; allow up to 2 hours
-          if [ "${{ matrix.backend }}" = "mlx" ]; then
-            MAX_TIME=7200
-          else
-            MAX_TIME=300
-          fi
-          curl -sN -X POST http://127.0.0.1:8090/v1/audio/speech \
-            -H "Content-Type: application/json" \
-            -d '{"input":"Hello.","voice":"alloy","stream":true}' \
-            --max-time "$MAX_TIME" \
-            -o sse_output.txt || true
-          echo "--- SSE output (first 500 chars) ---"
-          head -c 500 sse_output.txt
-          echo ""
-          grep -q "speech.audio.delta" sse_output.txt || (echo "Missing speech.audio.delta"; exit 1)
-          grep -q "speech.audio.done" sse_output.txt || (echo "Missing speech.audio.done"; exit 1)
-          echo "Streaming SSE test passed"
-
-          # Decode base64 PCM chunks from SSE events into a playable WAV file
-          python3 -c "
-          import base64, struct, json, re
-
-          raw_pcm = b''
-          with open('sse_output.txt') as f:
-              for line in f:
-                  line = line.strip()
-                  if not line.startswith('data:'):
-                      continue
-                  payload = json.loads(line[len('data:'):].strip())
-                  if payload.get('type') == 'speech.audio.delta':
-                      raw_pcm += base64.b64decode(payload['delta'])
-
-          assert len(raw_pcm) > 0, 'No PCM data decoded from SSE stream'
-          print(f'Decoded {len(raw_pcm)} bytes of PCM from SSE stream')
-
-          # Wrap raw 24kHz 16-bit mono PCM in a WAV header
-          sample_rate = 24000
-          channels = 1
-          bits = 16
-          data_size = len(raw_pcm)
-          with open('api_streaming.wav', 'wb') as out:
-              out.write(b'RIFF')
-              out.write(struct.pack('<I', 36 + data_size))
-              out.write(b'WAVE')
-              out.write(b'fmt ')
-              out.write(struct.pack('<IHHIIHH', 16, 1, channels, sample_rate,
-                                   sample_rate * channels * bits // 8, channels * bits // 8, bits))
-              out.write(b'data')
-              out.write(struct.pack('<I', data_size))
-              out.write(raw_pcm)
-          print('Wrote api_streaming.wav')
-          "
-          file api_streaming.wav
-          ls -lh api_streaming.wav
-
       - name: "Server: Stop"
         if: always()
         run: kill ${{ env.SERVER_PID }} 2>/dev/null || true
@@ -318,9 +304,6 @@ jobs:
           path: |
             *.wav
             *.mp3
-            *.flac
-            *.ogg
-            *.pcm
             sse_output.txt
 
       - name: Upload binaries

@@ -287,7 +287,7 @@ The API server supports 6 output formats: `wav`, `pcm`, `mp3`, `flac`, `ogg`/`op
 |--------|-------|-------------|-------|
 | `wav` | hound | `audio/wav` | 24kHz 16-bit mono |
 | `pcm` | raw | `audio/pcm` | 24kHz 16-bit LE mono |
-| `mp3` | mp3lame-encoder 0.2 | `audio/mpeg` | 24kHz mono, 128kbps CBR |
+| `mp3` | mp3lame-encoder 0.2 | `audio/mpeg` | Resampled to 44.1kHz, 128kbps CBR |
 | `flac` | flacenc 0.5 | `audio/flac` | 24kHz 16-bit mono, lossless |
 | `ogg`/`opus` | audiopus 0.2 + ogg 0.9 | `audio/ogg` | Resampled to 48kHz via rubato |
 

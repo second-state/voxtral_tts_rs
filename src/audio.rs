@@ -108,8 +108,19 @@ pub fn encode_pcm_i16(samples: &[f32]) -> Vec<u8> {
 }
 
 /// Encode f32 samples to MP3 bytes (mono, 128kbps CBR).
+///
+/// Resamples to 44100Hz before encoding. 24kHz is an MPEG-2 Layer III rate
+/// which causes playback issues (chipmunk effect) in many players.
 pub fn encode_mp3(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
     use mp3lame_encoder::{Builder, FlushNoGap, InterleavedPcm};
+
+    // Resample to 44100Hz — standard MPEG-1 rate with universal player support
+    let mp3_sample_rate = 44100u32;
+    let samples_44k = if sample_rate != mp3_sample_rate {
+        resample(samples, sample_rate, mp3_sample_rate)?
+    } else {
+        samples.to_vec()
+    };
 
     let mut encoder = Builder::new().ok_or_else(|| {
         VoxtralError::Audio("Failed to create MP3 encoder".to_string())
@@ -117,7 +128,7 @@ pub fn encode_mp3(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
     encoder.set_num_channels(1).map_err(|e| {
         VoxtralError::Audio(format!("MP3 encoder set_num_channels failed: {:?}", e))
     })?;
-    encoder.set_sample_rate(sample_rate).map_err(|e| {
+    encoder.set_sample_rate(mp3_sample_rate).map_err(|e| {
         VoxtralError::Audio(format!("MP3 encoder set_sample_rate failed: {:?}", e))
     })?;
     encoder
@@ -134,8 +145,8 @@ pub fn encode_mp3(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
         VoxtralError::Audio(format!("MP3 encoder build failed: {:?}", e))
     })?;
 
-    // Convert f32 to i16
-    let pcm: Vec<i16> = samples
+    // Convert resampled f32 to i16
+    let pcm: Vec<i16> = samples_44k
         .iter()
         .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
         .collect();

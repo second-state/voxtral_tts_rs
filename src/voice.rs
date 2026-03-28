@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::error::{Result, VoxtralError};
-use crate::tensor::{Device, Tensor};
+use crate::tensor::{DType, Device, Tensor};
 
 /// Preset voice names with OpenAI-compatible aliases.
 pub const PRESET_VOICES: &[&str] = &[
@@ -63,6 +63,10 @@ impl VoiceStore {
             return Ok(Self { embeddings });
         }
 
+        // On CPU, libtorch cannot do BF16 matmul — cast voice embeddings to F32
+        // (same logic as model weight loading in weights.rs)
+        let need_f32 = matches!(device, Device::Cpu);
+
         for name in PRESET_VOICES {
             let pt_path = voice_dir.join(format!("{}.pt", name));
             let safetensors_path = voice_dir.join(format!("{}.safetensors", name));
@@ -71,14 +75,24 @@ impl VoiceStore {
                 // Prefer safetensors format (works on both backends)
                 let tensors = Tensor::load_safetensors(&safetensors_path)?;
                 if let Some((_, tensor)) = tensors.into_iter().next() {
-                    embeddings.insert(name.to_string(), tensor.to_device(device));
+                    let tensor = if need_f32 {
+                        tensor.to_dtype(DType::Float32).to_device(device)
+                    } else {
+                        tensor.to_device(device)
+                    };
+                    embeddings.insert(name.to_string(), tensor);
                     tracing::debug!("Loaded voice embedding: {} (safetensors)", name);
                 }
             } else if pt_path.exists() {
                 // Fall back to .pt format (tch backend only)
                 match Tensor::load_pt(&pt_path) {
                     Ok(tensor) => {
-                        embeddings.insert(name.to_string(), tensor.to_device(device));
+                        let tensor = if need_f32 {
+                            tensor.to_dtype(DType::Float32).to_device(device)
+                        } else {
+                            tensor.to_device(device)
+                        };
+                        embeddings.insert(name.to_string(), tensor);
                         tracing::debug!("Loaded voice embedding: {} (.pt)", name);
                     }
                     Err(e) => {
