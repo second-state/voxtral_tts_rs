@@ -29,6 +29,11 @@ safetensors = "0.5"
 # Audio processing
 hound = "3.5"
 rubato = "0.16"
+symphonia = { version = "0.5", features = ["mp3", "aac", "flac", "ogg", "wav"] }
+mp3lame-encoder = "0.2"
+flacenc = "0.5"
+audiopus = "0.2"
+ogg = "0.9"
 
 # Utilities
 base64 = "0.22"

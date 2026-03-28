@@ -228,3 +228,27 @@ On Apple M4 Max (MLX backend):
 ### Remaining Bottleneck
 
 Flow matching is 80% of per-frame time (270ms vs 70ms backbone). Each frame requires 7 Euler steps × 3 transformer layers (batch=2, seq=3). The small matrix sizes [6, 3072] cannot saturate the GPU efficiently. The backbone is relatively efficient at ~2.6ms/layer for single-token decode with KV cache.
+
+## Audio Encoding (Multi-Format Output)
+
+The API server supports 6 output formats: `wav`, `pcm`, `mp3`, `flac`, `ogg`/`opus`. All encoding functions are in `src/audio.rs`, dispatched by `encode_audio()`.
+
+| Format | Crate | Content-Type | Notes |
+|--------|-------|-------------|-------|
+| `wav` | hound | `audio/wav` | 24kHz 16-bit mono |
+| `pcm` | raw | `audio/pcm` | 24kHz 16-bit LE mono |
+| `mp3` | mp3lame-encoder 0.2 | `audio/mpeg` | 24kHz mono, 128kbps CBR |
+| `flac` | flacenc 0.5 | `audio/flac` | 24kHz 16-bit mono, lossless |
+| `ogg`/`opus` | audiopus 0.2 + ogg 0.9 | `audio/ogg` | Resampled to 48kHz via rubato |
+
+### Crate API Pitfalls
+
+**mp3lame-encoder**: Use `encode_to_vec()` and `flush_to_vec::<FlushNoGap>()`, not `encode()` / `flush()`. The non-vec variants require `&mut [MaybeUninit<u8>]` buffers and unsafe `set_len()`.
+
+**flacenc**:
+- `into_verified()` returns `Result<Verified<Encoder>, (Encoder, VerifyError)>` — the error is a tuple, not a Display type. Map with `|(_enc, e)| ...`.
+- `MemSource::from_samples(&samples, channels, bits_per_sample, sample_rate)` — all params are `usize`, not `u32`. Cast `sample_rate as usize`.
+- Block size is `config.block_size` (singular `usize`), not `config.block_sizes[0]`.
+- Write output to `ByteSink` (alias for `MemSink<u8>`), not `Vec<u8>`. Use `ByteSink::new()`, `stream.write(&mut sink)`, `sink.into_inner()`.
+
+**audiopus**: `Encoder::new()` returns a non-mut encoder; `encode_float()` takes `&self`. Don't declare `let mut encoder`.

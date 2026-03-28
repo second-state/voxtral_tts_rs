@@ -131,11 +131,11 @@ Request body:
 | `input` | string | (required) | Text to synthesize (max 4096 chars) |
 | `model` | string | `voxtral-4b-tts` | Model name |
 | `voice` | string | `alloy` | Voice name or OpenAI alias |
-| `response_format` | string | `wav` | Output format: `wav` or `pcm` |
+| `response_format` | string | `wav` | Output format: `wav`, `pcm`, `mp3`, `flac`, `ogg`, `opus` |
 | `speed` | float | `1.0` | Speed multiplier (0.25–4.0, reserved) |
 | `stream` | bool | `false` | Enable SSE streaming |
 
-**Non-streaming** returns binary audio (`audio/wav` or `audio/pcm`).
+**Non-streaming** returns binary audio with the appropriate content type (`audio/wav`, `audio/pcm`, `audio/mpeg`, `audio/flac`, or `audio/ogg`).
 
 **Streaming** (`"stream": true`) returns Server-Sent Events with base64 PCM chunks:
 

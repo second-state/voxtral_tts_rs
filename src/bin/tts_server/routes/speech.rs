@@ -134,11 +134,12 @@ pub async fn create_speech(
         );
     }
 
-    if req.response_format != "wav" && req.response_format != "pcm" {
+    let supported_formats = ["wav", "pcm", "mp3", "flac", "ogg", "opus"];
+    if !supported_formats.contains(&req.response_format.as_str()) {
         return error_response(
             StatusCode::BAD_REQUEST,
             &format!(
-                "Unsupported response_format '{}'. Supported: wav, pcm.",
+                "Unsupported response_format '{}'. Supported: wav, pcm, mp3, flac, ogg.",
                 req.response_format,
             ),
             "invalid_request_error",
@@ -175,29 +176,19 @@ async fn handle_non_streaming(state: AppState, req: SpeechRequest) -> Response {
 
     match result {
         Ok(Ok((samples, sample_rate))) => {
-            let content_type = if format == "pcm" {
-                "audio/pcm"
-            } else {
-                "audio/wav"
-            };
-
-            let body = if format == "pcm" {
-                voxtral_tts::audio::encode_pcm_i16(&samples)
-            } else {
-                match voxtral_tts::audio::write_wav_bytes(&samples, sample_rate) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        return error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &format!("Failed to encode WAV: {}", e),
-                            "server_error",
-                            "encoding_error",
-                        );
-                    }
+            match voxtral_tts::audio::encode_audio(&samples, sample_rate, &format) {
+                Ok((body, content_type)) => {
+                    (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], body).into_response()
                 }
-            };
-
-            (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], body).into_response()
+                Err(e) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("Failed to encode audio: {}", e),
+                        "server_error",
+                        "encoding_error",
+                    );
+                }
+            }
         }
         Ok(Err(e)) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
