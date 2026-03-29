@@ -65,11 +65,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Determine compute device.
-    let device = voxtral_tts::Device::best_available();
+    let device = voxtral_tts_rs::Device::best_available();
     tracing::info!("Using device: {:?}", device);
 
     // Load the full model.
-    let tts = voxtral_tts::inference::VoxtralTTS::from_dir(&cli.model_dir, device)?;
+    let tts = voxtral_tts_rs::inference::VoxtralTTS::from_dir(&cli.model_dir, device)?;
 
     // Handle --list-voices.
     if cli.list_voices {
@@ -112,7 +112,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Write output WAV.
-    voxtral_tts::audio::write_wav_file(&cli.output, &samples, sample_rate)?;
+    voxtral_tts_rs::audio::write_wav_file(&cli.output, &samples, sample_rate)?;
     tracing::info!(
         "Wrote {:.2}s of audio to {}",
         samples.len() as f64 / sample_rate as f64,

@@ -12,7 +12,7 @@ use std::path::Path;
 
 use crate::config::VoxtralConfig;
 use crate::error::{Result, VoxtralError};
-use crate::tensor::{DType, Device, Tensor};
+use crate::tensor::{Device, Tensor};
 
 use super::backbone::{Backbone, BackboneConfig};
 use super::codec::Codec;

@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use voxtral_tts::inference::VoxtralTTS;
+use voxtral_tts_rs::inference::VoxtralTTS;
 
 /// Shared state holding the loaded TTS model behind a mutex.
 ///

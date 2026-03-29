@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use crate::config::VoxtralConfig;
-use crate::tensor::{DType, Device, Tensor};
+use crate::tensor::{Device, Tensor};
 
 use super::kv_cache::KVCache;
 
@@ -181,22 +181,6 @@ impl Backbone {
             let (out, new_k, new_v) = layer.forward(&h, &self.rotary_emb, 0, kv_cache.get(i), true);
             kv_cache.update(i, new_k, new_v);
             h = out;
-
-            // Log per-layer norms during prefill for cross-backend comparison
-            if i == 0 || i == 12 || i == 25 {
-                // Sample the last position's values for comparison
-                let last_pos = seq_len as i64 - 1;
-                let vals = h.select(1, last_pos).squeeze_dim(0).to_vec_f32();
-                let norm: f32 = vals.iter().map(|v| v * v).sum::<f32>().sqrt();
-                tracing::info!(
-                    "Prefill layer {} last_pos: norm={:.4}, min={:.4}, max={:.4}, first3=[{:.4}, {:.4}, {:.4}]",
-                    i, norm,
-                    vals.iter().cloned().fold(f32::INFINITY, f32::min),
-                    vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-                    vals.get(0).unwrap_or(&0.0), vals.get(1).unwrap_or(&0.0),
-                    vals.get(2).unwrap_or(&0.0),
-                );
-            }
         }
 
         let h = self.norm.forward(&h);
@@ -206,20 +190,6 @@ impl Backbone {
         // Single eval materializes the entire 26-layer prefill graph at once,
         // allowing MLX to optimize the full computation on the GPU.
         out.eval();
-        // Log prefill output norm for cross-backend comparison
-        {
-            let vals = out.to_vec_f32();
-            let norm: f32 = vals.iter().map(|v| v * v).sum::<f32>().sqrt();
-            tracing::info!(
-                "Prefill output: norm={:.4}, min={:.4}, max={:.4}, first5=[{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
-                norm,
-                vals.iter().cloned().fold(f32::INFINITY, f32::min),
-                vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-                vals.get(0).unwrap_or(&0.0), vals.get(1).unwrap_or(&0.0),
-                vals.get(2).unwrap_or(&0.0), vals.get(3).unwrap_or(&0.0),
-                vals.get(4).unwrap_or(&0.0),
-            );
-        }
         out
     }
 
@@ -232,20 +202,6 @@ impl Backbone {
     pub fn forward_one_embedding(&self, embedding: &Tensor, kv_cache: &mut KVCache) -> Tensor {
         let h = embedding.reshape(&[1, 1, self.config.dim as i64]);
         let pos = kv_cache.seq_len();
-        // Log input embedding for the first few decode steps
-        if pos <= 226 {
-            let vals = embedding.to_vec_f32();
-            let norm: f32 = vals.iter().map(|v| v * v).sum::<f32>().sqrt();
-            tracing::info!(
-                "Decode pos={}: input_norm={:.4}, first5=[{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]",
-                pos, norm,
-                vals.get(0).unwrap_or(&0.0), vals.get(1).unwrap_or(&0.0),
-                vals.get(2).unwrap_or(&0.0), vals.get(3).unwrap_or(&0.0),
-                vals.get(4).unwrap_or(&0.0),
-            );
-        }
-        // Log per-layer norms on first decode step (pos=225 for "Hello." with neutral_female)
-        let log_layers = pos <= 226;
         let mut h = h;
 
         for (i, layer) in self.layers.iter().enumerate() {
@@ -253,17 +209,6 @@ impl Backbone {
                 layer.forward(&h, &self.rotary_emb, pos, kv_cache.get(i), true);
             kv_cache.update(i, new_k, new_v);
             h = out;
-
-            if log_layers && (i == 0 || i == 12 || i == 25) {
-                let vals = h.squeeze_dim(0).squeeze_dim(0).to_vec_f32();
-                let norm: f32 = vals.iter().map(|v| v * v).sum::<f32>().sqrt();
-                tracing::info!(
-                    "Layer {} output: norm={:.4}, min={:.4}, max={:.4}",
-                    i, norm,
-                    vals.iter().cloned().fold(f32::INFINITY, f32::min),
-                    vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-                );
-            }
         }
 
         let out = self.norm.forward(&h).squeeze_dim(0).squeeze_dim(0); // [dim]

@@ -53,6 +53,9 @@ pub struct FlowMatchingTransformer {
     norm: RMSNorm,
     /// Pre-computed time step projections for all Euler steps (constant across frames).
     time_step_projs: Vec<Tensor>,
+    /// Pre-computed additive mask for semantic logits (on device).
+    /// mask[0] = -1e9 (EMPTY_AUDIO), mask[1..8194] = 0, mask[8194..] = -1e9 (padding).
+    semantic_mask: Tensor,
     /// Configuration.
     config: AcousticTransformerConfig,
 }
@@ -119,6 +122,18 @@ impl FlowMatchingTransformer {
             layers.push(layer);
         }
 
+        // Pre-compute semantic logit mask on device.
+        // mask[0] = -1e9 (EMPTY_AUDIO), mask[1..valid_end] = 0, mask[valid_end..] = -1e9 (padding)
+        let semantic_vocab_size = weights[&format!("{}.semantic_codebook_output.weight", prefix)]
+            .size()[0] as usize;
+        let valid_end = crate::NUM_AUDIO_SPECIAL_TOKENS + crate::SEMANTIC_CODEBOOK_SIZE; // 8194
+        let mut mask_data = vec![0.0f32; semantic_vocab_size];
+        mask_data[0] = -1e9; // EMPTY_AUDIO (never predict)
+        for v in mask_data[valid_end..].iter_mut() {
+            *v = -1e9; // padding beyond valid range
+        }
+        let semantic_mask = Tensor::from_slice_f32(&mask_data).to_device(device);
+
         // Pre-compute time step projections (constant for all frames).
         // These are sinusoidal embeddings projected through time_projection for each Euler step.
         let time_step_projs: Vec<Tensor> = (0..(NUM_EULER_STEPS - 1))
@@ -140,6 +155,7 @@ impl FlowMatchingTransformer {
             semantic_codebook_output,
             norm,
             time_step_projs,
+            semantic_mask,
             config,
         }
     }
@@ -163,44 +179,8 @@ impl FlowMatchingTransformer {
         let semantic_logits = self.semantic_codebook_output.forward(&llm_input);
         let semantic_logits = semantic_logits.squeeze_dim(0); // [codebook_size]
 
-        // Mask: set empty-audio to -1e9, but allow end-of-audio to be predicted
-        // Index 0 = EMPTY_AUDIO (never valid), Index 1 = END_AUDIO (signals stop)
-        // Valid semantic codes are in [2, 2 + 8192) = [2, 8194)
-        let mut logits_vec = semantic_logits.to_vec_f32();
-        // Mask only EMPTY_AUDIO (index 0); END_AUDIO (index 1) must remain
-        // unmasked so the model can signal end-of-generation naturally.
-        if !logits_vec.is_empty() {
-            logits_vec[0] = -1e9; // empty-audio (never predict)
-        }
-        for v in logits_vec
-            .iter_mut()
-            .skip(crate::NUM_AUDIO_SPECIAL_TOKENS + crate::SEMANTIC_CODEBOOK_SIZE)
-        {
-            *v = -1e9; // padding beyond valid range
-        }
-
-        // Log semantic logit diagnostics (helps debug EOS / degenerate code issues)
-        {
-            let eos_logit = logits_vec[crate::END_AUDIO_TOKEN_ID as usize];
-            // Find top-5 logits with indices
-            let mut indexed: Vec<(usize, f32)> = logits_vec.iter().enumerate()
-                .map(|(i, &v)| (i, v))
-                .collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let top5: Vec<_> = indexed.iter().take(5).collect();
-            let logit_mean: f32 = logits_vec.iter().sum::<f32>() / logits_vec.len() as f32;
-            let logit_std: f32 = (logits_vec.iter().map(|v| (v - logit_mean).powi(2)).sum::<f32>()
-                / logits_vec.len() as f32).sqrt();
-            tracing::info!(
-                "Semantic: EOS[1]={:.4}, top5=[{}], mean={:.4}, std={:.4}",
-                eos_logit,
-                top5.iter().map(|(i, v)| format!("{}:{:.3}", i, v)).collect::<Vec<_>>().join(", "),
-                logit_mean,
-                logit_std,
-            );
-        }
-
-        let semantic_logits = Tensor::from_slice_f32(&logits_vec).to_device(device);
+        // Apply pre-computed mask on GPU: -1e9 for EMPTY_AUDIO (idx 0) and padding (idx >= 8194)
+        let semantic_logits = &semantic_logits + &self.semantic_mask;
         let semantic_code = semantic_logits.argmax(0, false).int64_value(&[]);
 
         // Check for end-of-audio (0=empty_audio, 1=end_audio — both signal stop)

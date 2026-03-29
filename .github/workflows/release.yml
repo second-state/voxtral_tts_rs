@@ -112,7 +112,7 @@ jobs:
           cp target/release/voxtral-tts target/release/voxtral-tts-server ${{ matrix.asset-name }}/
           chmod +x ${{ matrix.asset-name }}/voxtral-tts ${{ matrix.asset-name }}/voxtral-tts-server
           if [ "${{ matrix.backend }}" = "mlx" ]; then
-            cp target/release/build/voxtral_tts-*/out/lib/mlx.metallib ${{ matrix.asset-name }}/ 2>/dev/null || true
+            cp target/release/build/voxtral_tts_rs-*/out/lib/mlx.metallib ${{ matrix.asset-name }}/ 2>/dev/null || true
           fi
           if [ "${{ matrix.backend }}" = "tch" ]; then
             cp -r libtorch ${{ matrix.asset-name }}/libtorch

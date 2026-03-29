@@ -54,12 +54,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Determine compute device.
-    let device = voxtral_tts::Device::best_available();
+    let device = voxtral_tts_rs::Device::best_available();
     tracing::info!("Using device: {:?}", device);
 
     // Load the full model.
     tracing::info!("Loading model from {} ...", cli.model_dir.display());
-    let tts = voxtral_tts::inference::VoxtralTTS::from_dir(&cli.model_dir, device)?;
+    let tts = voxtral_tts_rs::inference::VoxtralTTS::from_dir(&cli.model_dir, device)?;
     tracing::info!("Model loaded successfully");
 
     // Wrap in shared state.

@@ -176,7 +176,7 @@ async fn handle_non_streaming(state: AppState, req: SpeechRequest) -> Response {
 
     match result {
         Ok(Ok((samples, sample_rate))) => {
-            match voxtral_tts::audio::encode_audio(&samples, sample_rate, &format) {
+            match voxtral_tts_rs::audio::encode_audio(&samples, sample_rate, &format) {
                 Ok((body, content_type)) => {
                     (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], body).into_response()
                 }
@@ -244,7 +244,7 @@ async fn handle_streaming(state: AppState, req: SpeechRequest) -> Response {
             STREAMING_FIRST_CHUNK_FRAMES,
             STREAMING_CHUNK_FRAMES,
             |samples| {
-                let pcm_bytes = voxtral_tts::audio::encode_pcm_i16(samples);
+                let pcm_bytes = voxtral_tts_rs::audio::encode_pcm_i16(samples);
                 let delta = b64.encode(&pcm_bytes);
 
                 let payload = serde_json::json!({
@@ -288,7 +288,7 @@ async fn handle_streaming(state: AppState, req: SpeechRequest) -> Response {
 // ---------------------------------------------------------------------------
 
 use base64::Engine;
-use voxtral_tts::error::VoxtralError;
+use voxtral_tts_rs::error::VoxtralError;
 
 fn error_response(
     status: StatusCode,

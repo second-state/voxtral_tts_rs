@@ -149,20 +149,6 @@ impl VoxtralTTS {
         let gen_start = std::time::Instant::now();
 
         for frame_idx in 0..max_frames {
-            // Log diagnostics for first 3 frames to help debug backend issues
-            if frame_idx < 3 {
-                let h_vals = hidden_state.to_vec_f32();
-                let h_norm: f32 = h_vals.iter().map(|v| v * v).sum::<f32>().sqrt();
-                tracing::info!(
-                    "Frame {} hidden: dtype={:?}, norm={:.4}, min={:.4}, max={:.4}",
-                    frame_idx,
-                    hidden_state.kind(),
-                    h_norm,
-                    h_vals.iter().cloned().fold(f32::INFINITY, f32::min),
-                    h_vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-                );
-            }
-
             // Generate one frame of 37 codes from the current hidden state
             let codes = match self
                 .flow_matching
@@ -174,16 +160,6 @@ impl VoxtralTTS {
                     break;
                 }
             };
-
-            // Log first 3 frames' codes for debugging
-            if frame_idx < 3 {
-                tracing::info!(
-                    "Frame {} codes: sem={}, acoustic={:?}",
-                    frame_idx,
-                    codes[0],
-                    &codes[1..5],
-                );
-            }
 
             // Embed the generated codes for the next backbone step
             let next_embedding = self.backbone.embed_audio_codes(&codes);

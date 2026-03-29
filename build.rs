@@ -1,4 +1,4 @@
-// Build script for voxtral_tts.
+// Build script for voxtral-tts-rs.
 //
 // - When `tch-backend` is enabled: embeds libtorch RPATH into the binary
 // - When `mlx` is enabled (macOS only): builds mlx-c from submodule via CMake,
