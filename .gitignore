@@ -7,3 +7,4 @@ libtorch/
 *.pcm
 .DS_Store
 Cargo.lock
+libtorch.zip

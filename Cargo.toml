@@ -1,9 +1,10 @@
 [package]
 name = "voxtral-tts-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Michael Yuan <michael@secondstate.io>"]
 description = "Rust port of Voxtral TTS - Text-to-Speech model"
+repository = "https://github.com/second-state/voxtral_tts_rs"
 license = "Apache-2.0"
 keywords = ["tts", "text-to-speech", "voxtral", "mistral", "ai"]
 categories = ["multimedia::audio", "science"]
