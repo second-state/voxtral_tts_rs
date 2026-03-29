@@ -279,6 +279,29 @@ Voice Embedding ──> Backbone Decoder (3.4B, 26 layers) ──> Hidden States
 | `LIBTORCH` | Path to libtorch directory (Linux/tch backend only) |
 | `LIBTORCH_BYPASS_VERSION_CHECK` | Set to `1` to skip libtorch version check |
 
+## Performance
+
+Benchmarked on Apple M4 Max (MLX backend, Metal GPU). Long text (>400 chars) is automatically split into sentence chunks, each generated independently.
+
+| Test | Wall (s) | Audio (s) | RTF |
+|------|----------|-----------|-----|
+| CLI: Short English (neutral_female) | 9.88 | 1.36 | 7.26 |
+| CLI: Medium English (neutral_male) | 29.56 | 6.24 | 4.74 |
+| CLI: French (fr_female) | 24.59 | 5.04 | 4.88 |
+| CLI: Long text multi-chunk | 170.44 | 40.56 | 4.20 |
+| API: Short (alloy) | 9.44 | 2.16 | 4.37 |
+| API: Medium (neutral_female) | 33.36 | 8.08 | 4.13 |
+| API: Spanish (es_male) | 11.16 | 2.56 | 4.36 |
+| API: Long text multi-chunk | 165.35 | 40.24 | 4.11 |
+| API: Short MP3 (alloy) | 7.57 | — | — |
+
+**RTF** = real-time factor (wall time / audio duration). Lower is better; RTF < 1 means faster than real-time.
+
+- **~3.0 frames/s** sustained generation speed (~0.33s per frame)
+- **~3.3s** fixed prefill overhead per chunk (dominates short text RTF)
+- **Best RTF on long text (~4.1x)** where prefill cost is amortized across hundreds of frames
+- Short text has higher RTF (7.3x) because the 3.3s prefill dominates the 1.4s of audio
+
 ## License
 
 Apache-2.0
