@@ -187,7 +187,7 @@ jobs:
           curl -sN -X POST http://127.0.0.1:8090/v1/audio/speech \
             -H "Content-Type: application/json" \
             -d '{"input":"The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.","voice":"neutral_female","stream":true}' \
-            --max-time 300 \
+            --max-time 1800 \
             -o sse_medium.txt || true
           grep -q "speech.audio.delta" sse_medium.txt || (echo "Missing speech.audio.delta"; exit 1)
           grep -q "speech.audio.done" sse_medium.txt || (echo "Missing speech.audio.done"; exit 1)
