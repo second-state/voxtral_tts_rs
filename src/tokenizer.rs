@@ -29,6 +29,7 @@ struct TekkenConfig {
     #[serde(default = "default_num_special")]
     default_num_special_tokens: usize,
     #[serde(default)]
+    #[allow(dead_code)]
     default_vocab_size: usize,
 }
 
